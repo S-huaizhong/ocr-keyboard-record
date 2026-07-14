@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 setlocal EnableDelayedExpansion
-cd /d %~dp0
+cd /d "%~dp0"
 echo ============================================================
 echo   screen_search - Setup local virtual environment (.venv)
 echo ============================================================
@@ -38,6 +38,17 @@ exit /b 1
 
 :got_py
 echo [+] Using Python: !PY_EXE!
+
+REM Verify Python version >= 3.10
+"!PY_EXE!" -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo [-] Python 3.10 or newer is required.
+    for /f "usebackq delims=" %%V in (`"!PY_EXE!" -c "import sys;print('.'.join(map(str,sys.version_info[:3])))"`) do echo     Found: %%V
+    echo     Please install Python 3.10+ from https://www.python.org
+    pause
+    exit /b 5
+)
 echo.
 
 if exist "%~dp0.venv\Scripts\python.exe" (
@@ -82,6 +93,26 @@ if errorlevel 1 (
         REM rapidocr 装成功，再补装其余依赖
         "%VENV_PY%" -m pip install Pillow numpy keyboard winocr comtypes uiautomation pystray
     )
+)
+
+echo.
+echo [+] Verifying dependencies ...
+"%VENV_PY%" -c "import PIL, numpy, keyboard, winocr, pystray; print('[+] core imports OK'); import sys" 
+if errorlevel 1 (
+    echo.
+    echo [-] Core dependency verification failed. Please check errors above.
+    echo     The following modules must be importable: PIL, numpy, keyboard, winocr, pystray
+    pause
+    exit /b 4
+)
+"%VENV_PY%" -c "import comtypes, uiautomation; print('[+] UIA imports OK (Chinese IME capture available)')" 2>nul
+if errorlevel 1 (
+    echo [!] comtypes / uiautomation not importable - Chinese IME capture switch will be disabled.
+    echo     Other features still work normally.
+)
+"%VENV_PY%" -c "import rapidocr_onnxruntime; print('[+] RapidOCR OK (primary engine)')" 2>nul
+if errorlevel 1 (
+    echo [!] rapidocr-onnxruntime not importable - will fallback to winocr at runtime.
 )
 
 echo.
