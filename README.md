@@ -278,7 +278,7 @@ OCR results from the screen search flow are kept **in memory only** and released
 
 ## Known Issues
 
-The issues below are constrained by third-party models, system APIs, and IME internals. They **cannot be fully fixed at the project layer for the 1.0.0 release**, and remain candidates for the 1.1.x iteration.
+The issues below are limitations of the current single-file Python architecture, third-party OCR models, and Windows IME internals. Some may be addressed by future major-version rewrites; others are fundamentally out of scope.
 
 ### 1. Screen OCR: text lines containing Chinese or spaces exhibit rightward-cumulative highlight offset
 
@@ -291,7 +291,7 @@ The issues below are constrained by third-party models, system APIs, and IME int
 - The line-level bbox width still corresponds to the real pixel width including spaces. Any algorithm that "evenly divides the line bbox across recognized text" or "walks per character using physical width" will accumulate rightward offset because character counts do not match.
 - Each missing character position offsets subsequent characters by ~3–10 px; over a 20-character line the drift can exceed 60 px.
 
-**Approaches evaluated (none fully resolved in 1.0.0)**:
+**Approaches evaluated (none fully resolved)**:
 
 | Approach | Result |
 |---|---|
@@ -301,35 +301,39 @@ The issues below are constrained by third-party models, system APIs, and IME int
 | Heuristic secondary OCR (2× rescan for suspicious lines only) | Limited hit rate, higher CPU cost |
 | Whole-image 2× preprocessing then re-OCR | Space recall improves, but CPU ~4×, memory +~60 MB |
 
-**Future directions (1.1.x candidates)**:
+**Possible future directions**:
 
 - Introduce GPU / DirectML acceleration to make whole-image 2× preprocessing the default precision tier
 - Adopt the full PP-OCRv4 rec branch that emits character-level bboxes (the current slim ONNX build does not support this)
 - Migrate to a heavier OCR engine (full PaddleOCR, TrOCR, etc.) at the cost of initialization time and dependency size
 
-### 2. Input recording: Chinese IME committed text cannot be captured directly — only pinyin + selection digits + final result
+### 2. Input recording: Chinese IME committed text is captured through a best-effort UI Automation path
 
-**Symptom**: typing "你好" with Microsoft Pinyin, Sogou, QQ, Rime, etc. may show up in the panel as `你hao1好`, `nihao1你好`, or `n h a o 1 你好`. English input is unaffected; IMEs of other languages have not been tested.
+**Status (since 1.1.1)**: an opt-in UI Automation subscription to `EditControl.TextChanged` has been implemented, and can be enabled via the **Chinese IME capture** switch in the input-record panel. When it works, the log line will look like `{"kind":"ime","text":"你好"}` — the true committed text rather than the raw pinyin. The limitations below still apply to targets outside UI Automation's reach.
+
+**Symptom (when UIA capture is off or unavailable)**: typing "你好" with Microsoft Pinyin, Sogou, QQ, Rime, etc. may show up in the panel as `你hao1好`, `nihao1你好`, or `n h a o 1 你好`. English input is unaffected; IMEs of other languages have not been tested.
 
 **Technical cause**:
 
 - This project uses [`keyboard`](https://pypi.org/project/keyboard/) for keyboard hooks, which relies on the Windows `LowLevelKeyboardProc` kernel-mode hook — this only captures physical key down/up events.
 - Windows Chinese IMEs are built on TSF (Text Services Framework) or IMM32 internals. The entire conversion path from pinyin composition to the final commit happens inside the IME process, bypassing the normal keyboard message channel.
 - The IME dispatches the commit via `WM_IME_COMPOSITION` / `WM_CHAR` directly to the focused window, and these messages never reach the low-level keyboard hook.
-- Consequently, the hook only observes pinyin letters (as normal English keypresses) and candidate digits (as selection shortcuts). The final Chinese text is captured separately via clipboard or focus-window paths, producing the mixed string above.
-- Getting the true committed text requires either injecting the target process and hooking `ImmGetCompositionString` / TSF, or subscribing to UI Automation `EditControl.TextChanged`. The former involves DLL injection and UWP sandbox compatibility issues; the latter fails on sandboxed processes, games, and various custom-drawn input controls. Both are outside the scope of a single-file Python script.
+- Consequently, the hook alone only observes pinyin letters (as normal English keypresses) and candidate digits (as selection shortcuts). The final Chinese text has to be reconstructed separately — either via clipboard-adjacent capture or, since 1.1.1, via UI Automation subscribing to `TextChanged` events on focused edit controls.
+- The alternative — injecting the target process and hooking `ImmGetCompositionString` / TSF — involves DLL injection and UWP sandbox compatibility issues, and is out of scope for a single-file Python script.
 
-**Future directions (1.1.x candidates)**:
+**Coverage gaps of the current UIA implementation**:
 
-- Add UI Automation subscription to `EditControl.TextChanged` to correct mainstream native Win32 input boxes for Chinese commits
-- Use `pywinauto` or `comtypes` with IAccessible2 to fetch text increments near the caret
-- Unavoidable gaps: UWP sandboxed apps, some custom-drawn controls (e.g. VS Code Webviews, some browser extensions)
+- UWP sandboxed apps (Store apps, Widgets) — UIA events blocked by the sandbox
+- Custom-drawn input controls that don't expose the standard `Edit` pattern (e.g. VS Code Webviews, some browser extensions, IDE completion popups)
+- Games and fullscreen exclusive apps
+- Electron / Chromium WebView content without accessibility trees enabled
+- Any target where the switch is left disabled by the user (default state)
 
 ### 3. Screen OCR: extreme aspect-ratio images may return zero detections
 
 **Symptom**: when the screenshot height is below ~300 px and width above ~2000 px (e.g. system title bars, notification banners), RapidOCR DBNet may return an empty detection set. The `winocr` fallback still works in this case.
 
-**Technical cause**: DBNet's training samples cluster around a limited aspect-ratio range; extreme ratios fall outside its effective envelope. Introducing a more general detection model in 1.1.x would mitigate this.
+**Technical cause**: DBNet's training samples cluster around a limited aspect-ratio range; extreme ratios fall outside its effective envelope. A more general detection model in a future rewrite would mitigate this.
 
 ---
 
