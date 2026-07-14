@@ -1,0 +1,44 @@
+# Python 编译产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 用户运行时数据（隐私）
+# 键盘/剪贴板日志 —— 绝对不能上传
+memory/keylog/log.jsonl
+memory/keylog/log.jsonl.bak-*
+# 面板开关状态 + 语言偏好 —— 每台机器独立，程序会自动创建
+memory/keylog/config.json
+memory/keylog/lang.json
+# 通用备份
+*.bak
+*.bak-*
+*.orig
+
+# 诊断日志
+_diag_*.log
+*.log
+
+# RapidOCR 模型缓存（首次运行下载，各机器独立）
+.rapidocr_onnxruntime/
+
+# PyInstaller / 打包
+build/
+dist/
+*.spec
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 操作系统垃圾文件
+Thumbs.db
+desktop.ini
+.DS_Store

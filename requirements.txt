@@ -1,0 +1,40 @@
+# OCR & Keyboard Record — 依赖清单
+#
+# Python: 3.10+（脚本主要在 Python 3.14 版本测试；Windows 10/11）
+# 系统:   Windows 10 / 11（依赖 Win32 API、winocr、DPI awareness）
+#
+# 一键安装（推荐）：
+#   双击项目根目录的 setup.bat（自动建 .venv 并装依赖）
+#
+# 手动安装：
+#   python -m venv .venv
+#   .venv\Scripts\pip install -r requirements.txt
+#
+# 说明：
+#   - Pillow                图像截屏 + 绘制 + 图标位图
+#   - numpy                 RapidOCR 输入数组
+#   - keyboard              全局热键 (Ctrl+Alt+F / Ctrl+Alt+X) + 键盘监听
+#   - winocr                回退 OCR 引擎（调用 Windows 系统 OCR，需 Windows 10 1809+ 语言包）
+#   - rapidocr-onnxruntime  主 OCR 引擎（PP-OCRv4，纯 CPU）
+#   - comtypes              UIA 中文 IME 捕获（可选：不装则中文 IME 捕获自动禁用）
+#   - uiautomation          UIA 中文 IME 捕获（可选：同上）
+#   - pystray               系统托盘图标
+#
+# 注意：
+#   - onnxruntime 会作为 rapidocr-onnxruntime 的依赖自动安装
+#   - opencv-python 会作为 rapidocr-onnxruntime 的依赖自动安装
+#   - comtypes / uiautomation 是 UIA 中文 IME 捕获的支持库；不装时程序仍能启动，
+#     只是"中文 IME 捕获"开关会被自动置灰。
+
+Pillow>=10.0.0
+numpy>=1.24.0
+keyboard>=0.13.5
+winocr>=0.0.14
+# rapidocr-onnxruntime 1.2.3 官方安装器限 Python <=3.10，但约束仅在安装时检查：
+# 运行时它在 3.11 / 3.12 / 3.13 / 3.14 实测都能正常工作（onnxruntime + numpy + opencv 均已支持）。
+# 下面用 --ignore-requires-python 或直接指定 1.2.3 版本绕开安装器检查。
+# 如果实在装不上，代码会 fallback 到 winocr（Windows 内置 OCR）。
+rapidocr-onnxruntime==1.2.3
+comtypes>=1.2.0
+uiautomation>=2.0.18
+pystray>=0.19.5
