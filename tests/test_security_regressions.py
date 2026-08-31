@@ -1,5 +1,6 @@
 import ctypes
 import ctypes.wintypes as wt
+import inspect
 import json
 import os
 import queue
@@ -58,63 +59,23 @@ class NewTextHotkeyTests(unittest.TestCase):
         self.assertEqual(0.70, screen_search.TEXT_EDITOR_SCROLL_OPACITY)
         self.assertEqual("#8c8c8c", screen_search._scroll_thumb_color())
 
-    def test_builtin_editor_enables_native_dwm_shadow(self):
-        win = mock.Mock()
-        win.wm_frame.return_value = "0x1234"
-        dwmapi = mock.Mock()
-        dwmapi.DwmSetWindowAttribute.return_value = 0
-        dwmapi.DwmExtendFrameIntoClientArea.return_value = 0
+    def test_editor_uses_only_the_standard_windows_frame(self):
+        source = inspect.getsource(screen_search.TextDocumentWindow)
+        self.assertNotIn("overrideredirect", source)
+        self.assertNotIn("SetWindowLong", source)
+        self.assertNotIn("WM_NCHITTEST", source)
+        self.assertNotIn("_native_frame", source)
+        self.assertNotIn("_close_button", source)
 
-        self.assertTrue(screen_search._enable_native_window_shadow(win, dwmapi))
-
-        win.update_idletasks.assert_called_once_with()
-        policy_args = dwmapi.DwmSetWindowAttribute.call_args.args
-        self.assertEqual((0x1234, 2), policy_args[:2])
-        self.assertEqual(2, policy_args[2]._obj.value)
-        margins_args = dwmapi.DwmExtendFrameIntoClientArea.call_args.args
-        self.assertEqual(0x1234, margins_args[0])
-        margins = margins_args[1]._obj
-        self.assertEqual(
-            (1, 1, 1, 1),
-            (margins.cxLeftWidth, margins.cxRightWidth,
-             margins.cyTopHeight, margins.cyBottomHeight),
+        editor = screen_search.TextDocumentWindow.__new__(
+            screen_search.TextDocumentWindow
         )
-
-    def test_native_frameless_window_keeps_standard_frame_styles(self):
-        win = mock.Mock()
-        win.wm_frame.return_value = "0x1234"
-        user32 = mock.Mock()
-        user32.GetWindowLongW.return_value = 0x10000000
-        user32.SetWindowLongPtrW.return_value = 0x5678
-        user32.SetWindowPos.return_value = 1
-        dwmapi = mock.Mock()
-        dwmapi.DwmSetWindowAttribute.return_value = 0
-        dwmapi.DwmExtendFrameIntoClientArea.return_value = 0
-
-        state = screen_search._configure_native_frameless_window(
-            win, user32=user32, dwmapi=dwmapi
-        )
-
-        self.assertIsNotNone(state)
-        self.assertEqual(0x1234, state["hwnd"])
-        style = user32.SetWindowLongW.call_args.args[2]
-        self.assertEqual(0x00C00000, style & 0x00C00000)  # WS_CAPTION
-        self.assertEqual(0x00040000, style & 0x00040000)  # WS_THICKFRAME
-        self.assertEqual(-4, user32.SetWindowLongPtrW.call_args.args[1])
-        self.assertEqual(0x0037, user32.SetWindowPos.call_args.args[-1])
-
-    def test_native_window_bounds_preserve_requested_outer_size(self):
-        user32 = mock.Mock()
-        user32.SetWindowPos.return_value = 1
-        metrics = {"x": 1900, "y": 50, "width": 600, "height": 600}
-
-        self.assertTrue(screen_search._set_native_window_bounds(
-            0x1234, metrics, user32=user32
-        ))
-
-        self.assertEqual(
-            (0x1234, 0, 1900, 50, 600, 600, 0x0014),
-            user32.SetWindowPos.call_args.args,
+        editor.win = mock.Mock()
+        editor._focus_and_release_topmost = mock.Mock()
+        editor._show_standard_window()
+        editor.win.deiconify.assert_called_once_with()
+        editor.win.after.assert_called_once_with(
+            120, editor._focus_and_release_topmost
         )
 
     def test_builtin_editor_saves_utf8_text(self):
@@ -222,6 +183,47 @@ class SingleInstanceTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "Windows tray icon tests")
 class TrayIconTests(unittest.TestCase):
+    def test_native_hotkey_message_dispatches_registered_callback(self):
+        calls = []
+        tray = screen_search.NativeTray.__new__(screen_search.NativeTray)
+        tray._registered_hotkeys = {2: lambda: calls.append("keylog")}
+        tray._TaskbarCreated = 0
+
+        result = tray._wnd_proc(1, screen_search._WM_HOTKEY, 2, 0)
+
+        self.assertEqual(0, result)
+        self.assertEqual(["keylog"], calls)
+
+    def test_native_hotkeys_register_and_unregister_with_windows(self):
+        fake_user32 = mock.Mock()
+        fake_user32.RegisterHotKey.return_value = True
+        tray = screen_search.NativeTray.__new__(screen_search.NativeTray)
+        tray.hwnd = 0x1234
+        tray._hotkey_specs = {
+            1: (
+                screen_search._MOD_CONTROL
+                | screen_search._MOD_ALT
+                | screen_search._MOD_NOREPEAT,
+                ord("F"),
+                lambda: None,
+            )
+        }
+        tray._registered_hotkeys = {}
+
+        with mock.patch.object(screen_search, "_user32", fake_user32):
+            self.assertEqual(1, tray._register_hotkeys())
+            tray._unregister_hotkeys()
+
+        fake_user32.RegisterHotKey.assert_called_once_with(
+            0x1234,
+            1,
+            screen_search._MOD_CONTROL
+            | screen_search._MOD_ALT
+            | screen_search._MOD_NOREPEAT,
+            ord("F"),
+        )
+        fake_user32.UnregisterHotKey.assert_called_once_with(0x1234, 1)
+
     def test_small_tray_icon_is_blank_ruled_paper(self):
         image = screen_search._build_tray_icon_image(16)
         pixels = list(image.get_flattened_data())

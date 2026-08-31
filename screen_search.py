@@ -1340,175 +1340,6 @@ def _scroll_thumb_color(opacity=TEXT_EDITOR_SCROLL_OPACITY):
     return f"#{channel:02x}{channel:02x}{channel:02x}"
 
 
-class _DWM_MARGINS(ctypes.Structure):
-    _fields_ = [
-        ("cxLeftWidth", ctypes.c_int),
-        ("cxRightWidth", ctypes.c_int),
-        ("cyTopHeight", ctypes.c_int),
-        ("cyBottomHeight", ctypes.c_int),
-    ]
-
-
-def _window_handle(win):
-    """返回 Tk 顶层窗口对应的原生 Windows 外框句柄。"""
-    win.update_idletasks()
-    frame = win.wm_frame()
-    return int(frame, 16) if isinstance(frame, str) else int(frame)
-
-
-def _enable_native_window_shadow(win, dwmapi=None, hwnd=None):
-    """要求 DWM 按当前原生窗口样式绘制非客户区和系统阴影。"""
-    try:
-        hwnd = _window_handle(win) if hwnd is None else int(hwnd)
-        if not hwnd:
-            return False
-        if dwmapi is None:
-            dwmapi = ctypes.WinDLL("dwmapi")
-
-        dwmapi.DwmSetWindowAttribute.argtypes = [
-            wt.HWND, wt.DWORD, ctypes.c_void_p, wt.DWORD,
-        ]
-        dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
-        dwmapi.DwmExtendFrameIntoClientArea.argtypes = [
-            wt.HWND, ctypes.POINTER(_DWM_MARGINS),
-        ]
-        dwmapi.DwmExtendFrameIntoClientArea.restype = ctypes.c_long
-
-        # DWMWA_NCRENDERING_POLICY=2, DWMNCRP_ENABLED=2
-        policy = ctypes.c_int(2)
-        policy_result = dwmapi.DwmSetWindowAttribute(
-            hwnd, 2, ctypes.byref(policy), ctypes.sizeof(policy)
-        )
-        margins = _DWM_MARGINS(1, 1, 1, 1)
-        frame_result = dwmapi.DwmExtendFrameIntoClientArea(
-            hwnd, ctypes.byref(margins)
-        )
-        return policy_result >= 0 and frame_result >= 0
-    except Exception:
-        return False
-
-
-def _configure_native_frameless_window(win, user32=None, dwmapi=None):
-    """保留 DWM 原生框架能力，同时把 Tk 客户区扩展成无标题栏外观。
-
-    返回值必须由调用方持有：其中的 Python WndProc 回调在 HWND 生命周期内
-    不能被垃圾回收。
-    """
-    try:
-        hwnd = _window_handle(win)
-        if not hwnd:
-            return None
-        if user32 is None:
-            user32 = ctypes.WinDLL("user32", use_last_error=True)
-        if dwmapi is None:
-            dwmapi = ctypes.WinDLL("dwmapi")
-
-        get_window_long = user32.GetWindowLongW
-        get_window_long.argtypes = [wt.HWND, ctypes.c_int]
-        get_window_long.restype = ctypes.c_long
-        set_window_long_ptr = user32.SetWindowLongPtrW
-        set_window_long_ptr.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_void_p]
-        set_window_long_ptr.restype = ctypes.c_void_p
-        call_window_proc = user32.CallWindowProcW
-        call_window_proc.argtypes = [
-            ctypes.c_void_p, wt.HWND, wt.UINT, ctypes.c_size_t,
-            ctypes.c_ssize_t,
-        ]
-        call_window_proc.restype = ctypes.c_ssize_t
-        set_window_pos = user32.SetWindowPos
-        set_window_pos.argtypes = [
-            wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, wt.UINT,
-        ]
-        set_window_pos.restype = wt.BOOL
-
-        # 保留标准顶层窗口样式，让 DWM 将它视为可绘制原生阴影的窗口。
-        gwl_style = -16
-        gwlp_wndproc = -4
-        ws_caption = 0x00C00000
-        ws_thickframe = 0x00040000
-        ws_sysmenu = 0x00080000
-        ws_minimizebox = 0x00020000
-        style = int(get_window_long(hwnd, gwl_style))
-        native_style = (
-            style | ws_caption | ws_thickframe | ws_sysmenu | ws_minimizebox
-        )
-        user32.SetWindowLongW.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_long]
-        user32.SetWindowLongW.restype = ctypes.c_long
-        user32.SetWindowLongW(hwnd, gwl_style, native_style)
-
-        wm_nccalcsize = 0x0083
-        wm_ncaactivate = 0x0086
-        wndproc_type = ctypes.WINFUNCTYPE(
-            ctypes.c_ssize_t, wt.HWND, wt.UINT,
-            ctypes.c_size_t, ctypes.c_ssize_t,
-        )
-        original_wndproc = ctypes.c_void_p()
-
-        @wndproc_type
-        def frameless_wndproc(message_hwnd, message, wparam, lparam):
-            try:
-                if message == wm_nccalcsize and wparam:
-                    # 整个窗口矩形都交给 Tk 绘制；原生样式仍留给 DWM 生成阴影。
-                    return 0
-                if message == wm_ncaactivate:
-                    # 阻止激活状态变化触发标准标题栏重绘。
-                    return 1
-                return call_window_proc(
-                    original_wndproc, message_hwnd, message, wparam, lparam
-                )
-            except Exception:
-                return call_window_proc(
-                    original_wndproc, message_hwnd, message, wparam, lparam
-                )
-
-        callback_ptr = ctypes.cast(frameless_wndproc, ctypes.c_void_p)
-        previous = set_window_long_ptr(hwnd, gwlp_wndproc, callback_ptr)
-        previous_value = (
-            previous.value if isinstance(previous, ctypes.c_void_p) else int(previous)
-        )
-        if not previous_value:
-            return None
-        original_wndproc.value = previous_value
-
-        # SWP_FRAMECHANGED 使新样式立即重新计算；不移动、不缩放、不抢焦点。
-        swp_flags = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020
-        set_window_pos(hwnd, 0, 0, 0, 0, 0, swp_flags)
-        if not _enable_native_window_shadow(win, dwmapi, hwnd=hwnd):
-            set_window_long_ptr(
-                hwnd, gwlp_wndproc, ctypes.c_void_p(original_wndproc.value)
-            )
-            return None
-        return {
-            "hwnd": hwnd,
-            "wndproc": frameless_wndproc,
-            "original_wndproc": original_wndproc,
-        }
-    except Exception:
-        return None
-
-
-def _set_native_window_bounds(hwnd, metrics, user32=None):
-    """按外框尺寸精确定位 HWND，避免 Tk 把隐藏边框再次计入 geometry。"""
-    try:
-        if user32 is None:
-            user32 = ctypes.WinDLL("user32", use_last_error=True)
-        user32.SetWindowPos.argtypes = [
-            wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, wt.UINT,
-        ]
-        user32.SetWindowPos.restype = wt.BOOL
-        # SWP_NOZORDER | SWP_NOACTIVATE
-        return bool(user32.SetWindowPos(
-            int(hwnd), 0,
-            int(metrics["x"]), int(metrics["y"]),
-            int(metrics["width"]), int(metrics["height"]),
-            0x0004 | 0x0010,
-        ))
-    except Exception:
-        return False
-
-
 def _virtual_screen_metrics(win):
     """返回虚拟桌面边界和主屏物理高度。"""
     try:
@@ -1535,18 +1366,17 @@ class TextDocumentWindow:
         self._dirty = False
         self._on_closed = on_closed
         self._closed = False
-        self._native_frame = None
 
         self.win = tk.Toplevel(root)
-        # 在原生框架完成配置前保持隐藏，避免标准标题栏短暂闪现。
+        # 使用完整的 Windows 标准标题栏、边框、阴影和原生拖动行为。
         self.win.withdraw()
         virtual_bounds, screen_height = _virtual_screen_metrics(self.win)
         geometry, self._ui_scale = _scaled_editor_geometry(
             virtual_bounds, screen_height
         )
-        self._editor_metrics = _scaled_editor_metrics(screen_height)
         self._editor_geometry = geometry
         self.win.geometry(geometry)
+        self.win.resizable(True, True)
         self.win.protocol("WM_DELETE_WINDOW", self._close)
         self.win.configure(bg="#ffffff")
 
@@ -1571,21 +1401,6 @@ class TextDocumentWindow:
         )
         self._file_button.pack(side="left", fill="y")
 
-        self._close_button = tk.Button(
-            self.top_bar,
-            text="×",
-            command=self._close,
-            bg="#f3f3f3",
-            fg="#333333",
-            activebackground="#e81123",
-            activeforeground="#ffffff",
-            relief="flat",
-            bd=0,
-            font=("Segoe UI", 13),
-            width=3,
-        )
-        self._close_button.pack(side="right", fill="y")
-
         self.count_label = tk.Label(
             self.top_bar,
             anchor="e",
@@ -1595,10 +1410,6 @@ class TextDocumentWindow:
             padx=max(8, round(10 * self._ui_scale)),
         )
         self.count_label.pack(side="right", fill="y")
-
-        for drag_widget in (self.top_bar, self.count_label):
-            drag_widget.bind("<ButtonPress-1>", self._start_drag)
-            drag_widget.bind("<B1-Motion>", self._drag_window)
 
         body = tk.Frame(self.win, bg="#ffffff")
         body.pack(fill="both", expand=True)
@@ -1658,7 +1469,7 @@ class TextDocumentWindow:
         # 创建时短暂置顶以确保可见，随后恢复普通窗口层级。
         try:
             self.win.attributes("-topmost", True)
-            self.win.after_idle(self._show_with_native_frame)
+            self.win.after_idle(self._show_standard_window)
         except Exception:
             self.win.deiconify()
             self.text.focus_set()
@@ -1683,21 +1494,6 @@ class TextDocumentWindow:
                 old_menu.destroy()
             except Exception:
                 pass
-
-    def _start_drag(self, event):
-        self._drag_offset = (
-            event.x_root - self.win.winfo_x(),
-            event.y_root - self.win.winfo_y(),
-        )
-
-    def _drag_window(self, event):
-        try:
-            offset_x, offset_y = self._drag_offset
-            x = event.x_root - offset_x
-            y = event.y_root - offset_y
-            self.win.geometry(f"{x:+d}{y:+d}")
-        except Exception:
-            pass
 
     def _focus_editor(self):
         try:
@@ -1782,40 +1578,13 @@ class TextDocumentWindow:
         except Exception:
             pass
 
-    def _show_with_native_frame(self):
-        """配置原生无框外观后再显示，映射后重申 DWM 阴影策略。"""
+    def _show_standard_window(self):
+        """直接显示 Windows 标准装饰窗口，不修改原生样式或 WndProc。"""
         try:
-            # Tk 会在 withdrawn -> normal 时重建外层 HWND；必须先映射，再对子类化
-            # 最终句柄。先透明显示可避免标准标题栏在这一步短暂闪现。
-            self.win.attributes("-alpha", 0.0)
             self.win.deiconify()
-            # 映射消息处理完后 wm_frame() 才会从内部 Tk 子窗口切换为真正
-            # 的顶层包装 HWND。
-            self.win.after(20, self._finish_native_frame_setup)
-        except Exception:
-            self.win.deiconify()
-            self._focus_and_release_topmost()
-
-    def _finish_native_frame_setup(self):
-        try:
-            self._native_frame = _configure_native_frameless_window(self.win)
-            if self._native_frame:
-                _set_native_window_bounds(
-                    self._native_frame["hwnd"], self._editor_metrics
-                )
-            else:
-                self.win.geometry(self._editor_geometry)
-            self.win.attributes("-alpha", 1.0)
-            self.win.after(
-                20,
-                lambda: _enable_native_window_shadow(
-                    self.win,
-                    hwnd=(self._native_frame or {}).get("hwnd"),
-                ),
-            )
             self.win.after(120, self._focus_and_release_topmost)
         except Exception:
-            self.win.attributes("-alpha", 1.0)
+            self.win.deiconify()
             self._focus_and_release_topmost()
 
     def _document_name(self):
@@ -2764,6 +2533,11 @@ _WM_COMMAND = 0x0111
 _WM_LBUTTONUP = 0x0202
 _WM_RBUTTONUP = 0x0205
 _WM_LBUTTONDBLCLK = 0x0203
+_WM_HOTKEY = 0x0312
+
+_MOD_ALT = 0x0001
+_MOD_CONTROL = 0x0002
+_MOD_NOREPEAT = 0x4000
 
 _NIM_ADD = 0x00000000
 _NIM_MODIFY = 0x00000001
@@ -2866,6 +2640,10 @@ _user32.DestroyMenu.argtypes = [wt.HMENU]
 _user32.DestroyMenu.restype = wt.BOOL
 _user32.SetForegroundWindow.argtypes = [wt.HWND]
 _user32.SetForegroundWindow.restype = wt.BOOL
+_user32.RegisterHotKey.argtypes = [wt.HWND, ctypes.c_int, wt.UINT, wt.UINT]
+_user32.RegisterHotKey.restype = wt.BOOL
+_user32.UnregisterHotKey.argtypes = [wt.HWND, ctypes.c_int]
+_user32.UnregisterHotKey.restype = wt.BOOL
 _user32.LoadImageW.argtypes = [
     wt.HINSTANCE, wt.LPCWSTR, wt.UINT, ctypes.c_int, ctypes.c_int, wt.UINT,
 ]
@@ -2945,7 +2723,9 @@ def _pil_to_hicon(pil_img, width, height):
 class NativeTray:
     """纯 ctypes 系统托盘图标。使用 GetMessage 阻塞循环，适合在后台线程跑。"""
 
-    def __init__(self, tooltip, on_left_click, on_menu_items, on_quit):
+    def __init__(
+        self, tooltip, on_left_click, on_menu_items, on_quit, hotkeys=None
+    ):
         """
         tooltip: str
         on_left_click: () -> None  左键单击
@@ -2955,12 +2735,15 @@ class NativeTray:
             (text, [sub_item, ...])                # 子菜单，递归相同结构
             (text, callback, {"checked": bool})    # 带 ✓ 或 • 标记的项
         on_quit: () -> None
+        hotkeys: {id: (modifiers, virtual_key, callback)}
         """
         self.tooltip = tooltip
         self.on_left_click = on_left_click
         self._menu_spec = on_menu_items  # 保留原始 spec，每次 弹菜单时重新展开
         self._quit_cb = on_quit
         self._QUIT_ID = 999
+        self._hotkey_specs = dict(hotkeys or {})
+        self._registered_hotkeys = {}
         # 运行时 cmd_id → callback 映射，弹菜单时重建
         self._cmd_map = {}
 
@@ -2972,6 +2755,28 @@ class NativeTray:
         # 一定要用 self 保持 WNDPROC 不被 GC
         self._wndproc = WNDPROC(self._wnd_proc)
         self._running = False
+
+    def _register_hotkeys(self):
+        """把核心快捷键绑定到托盘窗口，由 Windows 消息循环长期持有。"""
+        self._registered_hotkeys = {}
+        for hotkey_id, spec in self._hotkey_specs.items():
+            modifiers, virtual_key, callback = spec
+            try:
+                if _user32.RegisterHotKey(
+                    self.hwnd, int(hotkey_id), int(modifiers), int(virtual_key)
+                ):
+                    self._registered_hotkeys[int(hotkey_id)] = callback
+            except Exception:
+                pass
+        return len(self._registered_hotkeys)
+
+    def _unregister_hotkeys(self):
+        for hotkey_id in tuple(self._registered_hotkeys):
+            try:
+                _user32.UnregisterHotKey(self.hwnd, hotkey_id)
+            except Exception:
+                pass
+        self._registered_hotkeys.clear()
 
     def set_menu(self, on_menu_items):
         """运行时更新菜单结构（例如语言切换后）。"""
@@ -3147,6 +2952,14 @@ class NativeTray:
             except Exception:
                 pass
             return 0
+        if msg == _WM_HOTKEY:
+            callback = self._registered_hotkeys.get(int(wparam))
+            if callback is not None:
+                try:
+                    callback()
+                except Exception:
+                    pass
+            return 0
         if msg == _WM_TRAYICON:
             # lParam 低字节＝鼠标消息
             m = lparam & 0xFFFF
@@ -3169,6 +2982,7 @@ class NativeTray:
         """阅 重。阻塞当前线程直到 stop。应在后台线程调用。"""
         self._register_class()
         self._create_hidden_window()
+        self._register_hotkeys()
         self._add_icon(pil_image)
         self._running = True
         msg = _MSG()
@@ -3178,6 +2992,7 @@ class NativeTray:
                 break
             _user32.TranslateMessage(ctypes.byref(msg))
             _user32.DispatchMessageW(ctypes.byref(msg))
+        self._unregister_hotkeys()
         self._remove_icon()
         try:
             _user32.DestroyWindow(self.hwnd)
@@ -3239,13 +3054,11 @@ class ScreenSearchApp:
         # 启动时清一次过期
         threading.Thread(target=self.keylog_store.cleanup, daemon=True).start()
 
-        # 主快捷键 + 输入记录快捷键 + 新建文本快捷键
-        keyboard.add_hotkey(HOTKEY, self._on_hotkey_ocr)
-        keyboard.add_hotkey(KEYLOG_HOTKEY, self._on_hotkey_keylog)
-        keyboard.add_hotkey(NEW_TEXT_HOTKEY, self._on_hotkey_new_text)
+        # Esc 与输入记录仍使用非阻塞键盘钩子；三个核心快捷键由托盘窗口
+        # 使用 RegisterHotKey 持有，避免低级钩子线程长时间运行后失效。
         keyboard.on_press_key(ESC_HOTKEY, self._on_esc, suppress=False)
 
-        # 键盘钩子（记录输入）— 必须放在 add_hotkey 之后以避免冲突
+        # 键盘钩子仅负责输入记录；核心快捷键不再依赖该钩子的寿命。
         self.key_hooker = KeyHooker(self.keylog_store, self)
         self.key_hooker.start()
 
@@ -3405,6 +3218,20 @@ class ScreenSearchApp:
             on_left_click=lambda: self.event_queue.put("toggle_ocr"),
             on_menu_items=_build_menu_spec(),
             on_quit=lambda: self.event_queue.put("quit"),
+            hotkeys={
+                1: (
+                    _MOD_CONTROL | _MOD_ALT | _MOD_NOREPEAT,
+                    ord("F"), self._on_hotkey_ocr,
+                ),
+                2: (
+                    _MOD_CONTROL | _MOD_ALT | _MOD_NOREPEAT,
+                    ord("X"), self._on_hotkey_keylog,
+                ),
+                3: (
+                    _MOD_CONTROL | _MOD_ALT | _MOD_NOREPEAT,
+                    ord("N"), self._on_hotkey_new_text,
+                ),
+            },
         )
 
         # 语言切换时→重建菜单 & tooltip

@@ -30,9 +30,9 @@ A system tray icon stays resident; the right-click menu can toggle the UI langua
 |---|---|---|
 | ![OCR search](./docs/screenshots/01-ocr-search-zh.png) | ![Selection mode](./docs/screenshots/02-pick-mode-zh.png) | ![Copy toast](./docs/screenshots/03-copy-toast-zh.png) |
 
-| Input-record panel | Tray icon & menu |
-|---|---|
-| ![Input panel](./docs/screenshots/04-input-panel-zh.png) | ![Tray menu](./docs/screenshots/05-tray-menu-zh.png) |
+| Input-record panel | New text editor | Tray icon & menu |
+|---|---|---|
+| ![Input panel](./docs/screenshots/04-input-panel-zh.png) | ![New text editor](./docs/screenshots/06-new-text-editor-en.png) | ![Tray menu](./docs/screenshots/05-tray-menu-en.png) |
 
 <details><summary>English UI variants</summary>
 
@@ -82,10 +82,18 @@ A system tray icon stays resident; the right-click menu can toggle the UI langua
 
 ### 5. Tray icon & language menu
 
-![Tray menu](./docs/screenshots/05-tray-menu-zh.png)
+![Tray menu](./docs/screenshots/05-tray-menu-en.png)
 
-- Left-click the tray icon = trigger screen OCR; right-click = full menu (Recognize screen / Input history / Language / Quit).
+- Left-click the tray icon = trigger screen OCR; right-click = full menu (Recognize screen / Input history / New text document / Language / Quit).
 - Language submenu switches the entire UI + hotkey tooltips + tray menu labels between Chinese and English instantly — no restart needed.
+
+### 6. Built-in text editor
+
+![New text editor](./docs/screenshots/06-new-text-editor-en.png)
+
+- Open it from `Ctrl+Alt+N` or **New Text Document** in the tray menu.
+- Uses the standard Windows title bar, border, native dragging, resizing, minimize, and close behavior.
+- Keeps live character count, automatic wrapping, 14-point text, Save, Save As, and unsaved-change confirmation.
 
 ---
 
@@ -168,7 +176,7 @@ After launch:
 
 - Tray icon: a blank ruled-paper design rendered independently at native sizes from 16 to 64 pixels; left-click triggers screen OCR, while the right-click menu provides OCR, input history, and a new text document
 - Global hotkeys: `Ctrl+Alt+F` opens the OCR overlay, `Ctrl+Alt+X` opens the input-record window, and `Ctrl+Alt+N` opens the built-in text editor and brings it to the foreground
-- Built-in text editor: visually frameless UI that retains native Win32 frame styles and delegates its real shadow to Windows DWM (no extra shadow window), using the top-right anchor `(2500, 50)` and size `600×600` at 2K (top-left `(1900, 50)`) as the proportional baseline for 1080p and 4K; the live character count sits in the top File bar, while a visually 70%-opaque scrollbar floats inside the text area only when scrolling is needed; includes 14-point text, automatic wrapping, Save, Save As, and Close
+- Built-in text editor: standard Windows title bar, border, native shadow, dragging, resizing, minimize, and close behavior; uses the top-right anchor `(2500, 50)` and client size `600×600` at 2K (top-left `(1900, 50)`) as the proportional baseline for 1080p and 4K. The live character count sits in the File toolbar, while a visually 70%-opaque scrollbar floats inside the text area only when scrolling is needed; includes 14-point text, automatic wrapping, Save, Save As, and close confirmation
 
 ## Logon autostart
 
