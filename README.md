@@ -1,6 +1,6 @@
 # OCR & Keyboard Record
 
-@S.huaizhong & LaoXia(ark-code-latest)  ·  Version 1.1.3 · [CHANGELOG](./CHANGELOG.md)
+@S.huaizhong & LaoXia(ark-code-latest)  ·  Version 1.1.4 · [CHANGELOG](./CHANGELOG.md)
 
 [中文](./README.zh-CN.md) · **English**
 
@@ -78,6 +78,7 @@ A system tray icon stays resident; the right-click menu can toggle the UI langua
 - Special keys are rendered as bracket tags such as `[*Ctrl+V]` `[*←]` `[*Enter]`; clipboard blocks get their own `───[Clipboard ...]───` separators highlighted in yellow.
 - Top toolbar: `Reload` · `Copy all` · `Clear` · retention (3 / 7 / 15 days).
 - Right-side privacy switches (all **OFF** by default): keyboard log, clipboard watch, Chinese IME capture, plus autostart (normal / elevated).
+- Since 1.1.4, history is paged backwards from disk instead of being fully loaded when the panel opens.
 
 ### 5. Tray icon & language menu
 
@@ -165,8 +166,9 @@ run_screen_search_debug.bat
 
 After launch:
 
-- Tray icon: left-click triggers screen OCR, right-click opens the menu
-- Global hotkeys: `Ctrl+Alt+F` opens the OCR overlay, `Ctrl+Alt+X` opens the input-record window
+- Tray icon: a blank ruled-paper design rendered independently at native sizes from 16 to 64 pixels; left-click triggers screen OCR, while the right-click menu provides OCR, input history, and a new text document
+- Global hotkeys: `Ctrl+Alt+F` opens the OCR overlay, `Ctrl+Alt+X` opens the input-record window, and `Ctrl+Alt+N` opens the built-in text editor and brings it to the foreground
+- Built-in text editor: visually frameless UI that retains native Win32 frame styles and delegates its real shadow to Windows DWM (no extra shadow window), using the top-right anchor `(2500, 50)` and size `600×600` at 2K (top-left `(1900, 50)`) as the proportional baseline for 1080p and 4K; the live character count sits in the top File bar, while a visually 70%-opaque scrollbar floats inside the text area only when scrolling is needed; includes 14-point text, automatic wrapping, Save, Save As, and Close
 
 ## Logon autostart
 
@@ -266,6 +268,8 @@ OCR results from the screen search flow are kept **in memory only** and released
 ### Privacy
 
 **Privacy opt-in by default**: since 1.1.x, keyboard logging / clipboard watching / Chinese IME capture are **all disabled on first launch** and must be enabled manually in the panel. Switch states are stored in `memory/keylog/config.json` (`keylog_enabled` / `clipboard_enabled` / `uia_enabled`), and the tray tooltip shows the current recording state in real time (K / C / IME combo or OFF).
+
+Since 1.1.4, disabling a switch prevents the corresponding clipboard or focused-control content from being read, not merely written to the log. A per-installation single-instance guard also prevents duplicate hooks and duplicate records.
 
 `log.jsonl` stores the **complete local keyboard + clipboard activity** (only when the corresponding switch is on), which may include passwords, private chats, verification codes, and other sensitive information. Please note:
 

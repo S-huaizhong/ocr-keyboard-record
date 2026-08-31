@@ -5,7 +5,8 @@
 全局屏幕文本搜索 + 输入记录插件
 - Ctrl+Alt+F : 截取屏幕 → OCR → 覆盖层搜索高亮
 - Ctrl+Alt+X : 打开输入记录（含剪贴板项）
-- 托盘图标   : 左键 OCR；右键菜单可打开输入记录 / 退出
+- Ctrl+Alt+N : 打开内置轻量文本编辑器
+- 托盘图标   : 左键 OCR；右键菜单可打开输入记录 / 新建文本 / 退出
 
 输入记录规则（n天保留，按本地 0 点滚动清理）：
 - 键盘输入：一坨接在一起，不分行
@@ -23,10 +24,12 @@ import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
 from datetime import datetime, timedelta
+from tkinter import filedialog, messagebox
 
 # ---- DPI 感知：确保 PIL 截图与 Tk 坐标一致 ----
 try:
@@ -37,7 +40,7 @@ except Exception:
     except Exception:
         pass
 
-from PIL import ImageGrab, Image, ImageDraw, ImageFont, ImageTk
+from PIL import ImageGrab, Image, ImageDraw, ImageTk
 import numpy as np
 
 try:
@@ -52,6 +55,15 @@ import keyboard
 HOTKEY = "ctrl+alt+f"
 ESC_HOTKEY = "esc"
 KEYLOG_HOTKEY = "ctrl+alt+x"
+NEW_TEXT_HOTKEY = "ctrl+alt+n"
+TEXT_EDITOR_FONT_SIZE = 14
+TEXT_EDITOR_WRAP = "word"
+TEXT_EDITOR_WIDTH = 600
+TEXT_EDITOR_HEIGHT = 600
+TEXT_EDITOR_RIGHT = 2500
+TEXT_EDITOR_Y = 50
+TEXT_EDITOR_REFERENCE_HEIGHT = 1440
+TEXT_EDITOR_SCROLL_OPACITY = 0.70
 OCR_LANG = "zh-CN"
 OCR_TIMEOUT_SEC = 15
 TRANSPARENT_COLOR = "#010203"
@@ -70,6 +82,9 @@ KEYLOG_RETENTION_CHOICES = (3, 7, 15)
 # - 视口滚到顶部后，每次追加 ~1000 字符
 KEYLOG_INITIAL_CHARS = 2000
 KEYLOG_CHUNK_CHARS = 1000
+KEYLOG_PAGE_MAX_RECORDS = 8000
+KEYLOG_COPY_MAX_CHARS = 2_000_000
+CLIPBOARD_MAX_CHARS = 16_384
 
 # 中日韩 IME 语言 ID（HKL 低 16 位）
 _CJK_IME_LANG_IDS = {0x0804, 0x0404, 0x0411, 0x0412}
@@ -80,16 +95,55 @@ _CJK_IME_LANG_IDS = {0x0804, 0x0404, 0x0411, 0x0412}
 # ============================================================
 LANG_CONFIG_FILE = os.path.join(_SCRIPT_DIR, "memory", "keylog", "lang.json")
 
+
+def _atomic_write_json(path, data):
+    """Write JSON beside the destination and atomically replace the target."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        raise
+
 _I18N = {
     "zh": {
         # 托盘
         "tray_tooltip": "屏幕 OCR + 输入记录\n左键: 识别 · 右键: 菜单",
         "tray_ocr": "识别屏幕 (Ctrl+Alt+F)",
         "tray_keylog": "输入记录 (Ctrl+Alt+X)",
+        "tray_new_text": "新建文本文档 (Ctrl+Alt+N)",
         "tray_language": "选择语言",
         "tray_lang_zh": "中文",
         "tray_lang_en": "English",
         "tray_quit": "退出",
+        # 内置文本编辑器
+        "text_editor_untitled": "无标题",
+        "text_editor_suffix": "文本文档",
+        "text_editor_file": "文件",
+        "text_editor_save": "保存",
+        "text_editor_save_as": "另存为…",
+        "text_editor_close": "关闭",
+        "text_editor_chars": "字数: {count}",
+        "text_editor_save_error_title": "保存失败",
+        "text_editor_save_error": "无法保存文件:\n{err}",
+        "text_editor_close_title": "保存更改",
+        "text_editor_close_msg": "文档尚未保存，是否先保存更改？",
+        "text_editor_filetype": "文本文档",
+        "text_editor_all_files": "所有文件",
         # 输入记录面板
         "win_title": "输入记录（Ctrl+Alt+X）  @S.HZ & XIA",
         "header_title": "键盘输入+剪贴板",
@@ -111,7 +165,8 @@ _I18N = {
         "days_suffix": "天",
         "loading": "加载中…",
         "count_full": "共 {total} 条 · {chars} 字符（已全部加载）",
-        "count_partial": "共 {total} 条 · 已显示 {loaded} 条 / {chars} 字符（↑ 滚动加载更早）",
+        "count_paged": "已显示 {loaded} 条 / {chars} 字符（↑ 滚动加载更早）",
+        "copy_too_large": "记录过大（超过 {limit} 字符），请分段选择复制",
         "toast_autostart_install_fail": "开机启动安装失败",
         "toast_autostart_remove_fail": "删除开机启动失败（需管理员）",
         "toast_uac_fail": "启动 UAC 失败或被拒绝",
@@ -141,16 +196,31 @@ _I18N = {
         "sel_btn_close": "✖",
         "sel_toast_copied": "已复制 {n} 字",
         "sel_toast_empty": "选区内无文字",
-        "startup_line": "[screen_search] 已启动: OCR={ocr} · KeyLog={kl}",
+        "startup_line": "[screen_search] 已启动: OCR={ocr} · KeyLog={kl} · NewText={nt}",
     },
     "en": {
         "tray_tooltip": "Screen OCR + Input History\nLeft: OCR · Right: menu",
         "tray_ocr": "Recognize Screen (Ctrl+Alt+F)",
         "tray_keylog": "Input History (Ctrl+Alt+X)",
+        "tray_new_text": "New Text Document (Ctrl+Alt+N)",
         "tray_language": "Language",
         "tray_lang_zh": "中文",
         "tray_lang_en": "English",
         "tray_quit": "Quit",
+        # Built-in text editor
+        "text_editor_untitled": "Untitled",
+        "text_editor_suffix": "Text Document",
+        "text_editor_file": "File",
+        "text_editor_save": "Save",
+        "text_editor_save_as": "Save As…",
+        "text_editor_close": "Close",
+        "text_editor_chars": "Characters: {count}",
+        "text_editor_save_error_title": "Save Failed",
+        "text_editor_save_error": "Could not save the file:\n{err}",
+        "text_editor_close_title": "Save Changes",
+        "text_editor_close_msg": "This document has unsaved changes. Save them first?",
+        "text_editor_filetype": "Text documents",
+        "text_editor_all_files": "All files",
         "win_title": "Input History (Ctrl+Alt+X)  @S.HZ & XIA",
         "header_title": "Keyboard + Clipboard",
         "btn_reload": "🔄 Reload",
@@ -171,7 +241,8 @@ _I18N = {
         "days_suffix": "d",
         "loading": "Loading…",
         "count_full": "{total} entries · {chars} chars (fully loaded)",
-        "count_partial": "{total} entries · shown {loaded} / {chars} chars (↑ scroll to load older)",
+        "count_paged": "Shown {loaded} entries / {chars} chars (↑ scroll to load older)",
+        "copy_too_large": "History exceeds {limit} chars; copy it in smaller selections",
         "toast_autostart_install_fail": "Failed to install autostart",
         "toast_autostart_remove_fail": "Failed to remove autostart (needs admin)",
         "toast_uac_fail": "UAC failed or was declined",
@@ -199,7 +270,7 @@ _I18N = {
         "sel_btn_close": "✖",
         "sel_toast_copied": "Copied {n} chars",
         "sel_toast_empty": "No text in selection",
-        "startup_line": "[screen_search] started: OCR={ocr} · KeyLog={kl}",
+        "startup_line": "[screen_search] started: OCR={ocr} · KeyLog={kl} · NewText={nt}",
     },
 }
 
@@ -215,9 +286,7 @@ def _load_lang():
 
 def _save_lang(lang):
     try:
-        os.makedirs(os.path.dirname(LANG_CONFIG_FILE), exist_ok=True)
-        with open(LANG_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump({"lang": lang}, f)
+        _atomic_write_json(LANG_CONFIG_FILE, {"lang": lang})
     except Exception:
         pass
 
@@ -343,8 +412,7 @@ class KeyLogStore:
                 "clipboard_enabled": self.clipboard_enabled,
                 "uia_enabled": self.uia_enabled,
             }
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            _atomic_write_json(self.config_path, data)
         except Exception:
             pass
 
@@ -417,9 +485,15 @@ class KeyLogStore:
         with self._lock:
             if not os.path.exists(self.path):
                 return
-            tmp = self.path + ".tmp"
+            tmp = None
             kept = 0
             try:
+                fd, tmp = tempfile.mkstemp(
+                    prefix=os.path.basename(self.path) + ".cleanup.",
+                    suffix=".tmp",
+                    dir=os.path.dirname(os.path.abspath(self.path)),
+                )
+                os.close(fd)
                 with open(self.path, "r", encoding="utf-8") as fi, \
                      open(tmp, "w", encoding="utf-8", newline="") as fo:
                     for line in fi:
@@ -436,33 +510,81 @@ class KeyLogStore:
                 os.replace(tmp, self.path)
             except Exception:
                 try:
-                    if os.path.exists(tmp):
+                    if tmp and os.path.exists(tmp):
                         os.remove(tmp)
                 except Exception:
                     pass
 
-    def load_recent(self):
+    @staticmethod
+    def _approx_record_len(rec):
+        text = rec.get("text", "") or ""
+        if rec.get("kind") == "clip":
+            return len(text) + 60
+        if rec.get("kind") == "key" and text.startswith("[*") and text.endswith("]"):
+            return 0
+        return len(text)
+
+    def load_page_before(self, end_offset=None, target_chars=KEYLOG_CHUNK_CHARS,
+                         max_records=KEYLOG_PAGE_MAX_RECORDS):
+        """Read one bounded page ending before *end_offset* without loading all JSONL."""
         cutoff = self._cutoff_ts()
-        recs = []
         with self._lock:
             if not os.path.exists(self.path):
-                return recs
+                return [], 0, False
             try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            r = json.loads(line)
-                        except Exception:
-                            continue
-                        if r.get("ts", 0) >= cutoff:
-                            recs.append(r)
+                with open(self.path, "rb") as f:
+                    file_size = f.seek(0, os.SEEK_END)
+                    end = file_size if end_offset is None else max(0, min(int(end_offset), file_size))
+                    pos = end
+                    data = b""
+                    parsed = []
+                    while pos > 0:
+                        start = max(0, pos - 65536)
+                        f.seek(start)
+                        data = f.read(pos - start) + data
+                        pos = start
+                        lines = data.splitlines(keepends=True)
+                        if pos > 0 and lines:
+                            lines = lines[1:]
+                        parsed = []
+                        newest_ts = None
+                        cursor = len(data) - sum(len(x) for x in lines)
+                        for raw in lines:
+                            line_start = pos + cursor
+                            cursor += len(raw)
+                            try:
+                                rec = json.loads(raw.decode("utf-8").strip())
+                            except Exception:
+                                continue
+                            rec_ts = rec.get("ts", 0)
+                            newest_ts = rec_ts if newest_ts is None else max(newest_ts, rec_ts)
+                            if rec_ts >= cutoff:
+                                parsed.append((line_start, rec))
+                        if newest_ts is not None and newest_ts < cutoff:
+                            return [], 0, False
+                        visible = 0
+                        used = 0
+                        for _, rec in reversed(parsed):
+                            visible += self._approx_record_len(rec)
+                            used += 1
+                            if visible >= target_chars or used >= max_records:
+                                break
+                        if visible >= target_chars or used >= max_records or pos == 0:
+                            break
+                    selected = []
+                    visible = 0
+                    for line_start, rec in reversed(parsed):
+                        if selected and (visible >= target_chars or len(selected) >= max_records):
+                            break
+                        selected.append((line_start, rec))
+                        visible += self._approx_record_len(rec)
+                    selected.reverse()
+                    if not selected:
+                        return [], 0, False
+                    before = selected[0][0]
+                    return [rec for _, rec in selected], before, before > 0
             except Exception:
-                pass
-        recs.sort(key=lambda r: r.get("ts", 0))
-        return recs
+                return [], 0, False
 
     @staticmethod
     def format_records(recs):
@@ -520,6 +642,69 @@ class KeyLogStore:
         if buf:
             out_parts.append(flush_buf(buf))
         return "".join(out_parts)
+
+    def build_copy_text(self, max_chars=KEYLOG_COPY_MAX_CHARS):
+        """Stream JSONL into bounded copy text without retaining record objects."""
+        cutoff = self._cutoff_ts()
+        parts = []
+        char_count = 0
+        run_token = None
+        run_count = 0
+
+        def emit(value):
+            nonlocal char_count
+            if not value:
+                return
+            char_count += len(value)
+            if char_count > max_chars:
+                raise ValueError("copy text too large")
+            parts.append(value)
+
+        def flush_run():
+            nonlocal run_token, run_count
+            if run_token is None:
+                return
+            if run_count >= 5:
+                emit(f"{run_token}*{run_count}")
+            else:
+                emit(run_token * run_count)
+            run_token = None
+            run_count = 0
+
+        with self._lock:
+            if not os.path.exists(self.path):
+                return ""
+            with open(self.path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if rec.get("ts", 0) < cutoff:
+                        continue
+                    kind = rec.get("kind")
+                    text = rec.get("text", "") or ""
+                    if kind in ("key", "ime"):
+                        if kind == "key" and text.startswith("[*") and text.endswith("]"):
+                            continue
+                        if text == run_token:
+                            run_count += 1
+                        else:
+                            flush_run()
+                            run_token = text
+                            run_count = 1
+                    elif kind == "clip":
+                        flush_run()
+                        try:
+                            stamp = datetime.fromtimestamp(rec.get("ts", 0)).strftime(
+                                "%b %d %H:%M:%S" if LANG == "en" else "%m-%d %H:%M:%S"
+                            )
+                        except Exception:
+                            stamp = "?"
+                        label = "Clipboard" if LANG == "en" else "剪贴板"
+                        emit(f"\n\n───[{label} {stamp}]───\n{text}\n───[/{label}]───\n\n")
+                flush_run()
+        return "".join(parts)
 
 
 # ============================================================
@@ -602,9 +787,13 @@ class KeyHooker:
         self._ime_cache_ts = 0.0
         # 单调递增的按键计数器：供 UIAWatcher 判断“真的有人在敊键”（只统计非修饰键的 down）
         self._press_count = 0
+        self._last_press_monotonic = 0.0
 
     def get_press_count(self):
         return self._press_count
+
+    def had_recent_press(self, max_age=3.0):
+        return (time.monotonic() - self._last_press_monotonic) <= max_age
 
     def _cached_ime_state(self):
         now = time.time()
@@ -667,6 +856,11 @@ class KeyHooker:
                 pass
 
     def _on_event(self, event):
+        if not self.store.keylog_enabled:
+            with self._ascii_lock:
+                self._ascii_buf.clear()
+            self._active_mods.clear()
+            return
         try:
             name = (event.name or "").lower()
         except Exception:
@@ -687,6 +881,7 @@ class KeyHooker:
 
         # 非修饰键的 keydown → 计数 +1（供 UIAWatcher 作“输入人证”）
         self._press_count += 1
+        self._last_press_monotonic = time.monotonic()
 
         # 任何非 ascii 事件到达：先把 buffer 里的字母/数字刷到磁盘，保证时序
         # （仅当下一行将写入非 ascii 标签时才需要）
@@ -799,6 +994,8 @@ class ClipboardWatcher(threading.Thread):
         k32.GlobalLock.restype = ctypes.c_void_p
         k32.GlobalUnlock.argtypes = [wt.HANDLE]
         k32.GlobalUnlock.restype = wt.BOOL
+        k32.GlobalSize.argtypes = [wt.HANDLE]
+        k32.GlobalSize.restype = ctypes.c_size_t
 
     def stop(self):
         self._stop.set()
@@ -849,7 +1046,14 @@ class ClipboardWatcher(threading.Thread):
             if not ptr:
                 return None
             try:
-                text = ctypes.wstring_at(ptr)
+                size_bytes = int(kernel32.GlobalSize(handle))
+                if size_bytes <= 0:
+                    return None
+                max_chars = min(
+                    CLIPBOARD_MAX_CHARS,
+                    max(0, size_bytes // ctypes.sizeof(ctypes.c_wchar)),
+                )
+                text = ctypes.wstring_at(ptr, max_chars).split("\x00", 1)[0]
             finally:
                 kernel32.GlobalUnlock(handle)
             return text
@@ -873,20 +1077,16 @@ class ClipboardWatcher(threading.Thread):
                 seq = user32.GetClipboardSequenceNumber()
                 if seq != self._last_seq:
                     self._last_seq = seq
+                    if not self.store.clipboard_enabled:
+                        self._stop.wait(0.25)
+                        continue
                     text = self._read_text()
                     if text:
                         # 本程序自己写的剪贴板（复制日志/选区）不记入，避免自循环
                         if self._consume_suppress(text):
                             continue
-                        # 防循环兄弟：内容里包含本工具自己的剪贴板块标记 ───[剪贴板 xxx]─── / ───[Clipboard xxx]───
-                        # 基本矪上就是“全选复制”转存 (suppress 因 \r\n 归一化不同而未命中)，直接丢弃。
-                        if ("───[剪贴板 " in text or "───[Clipboard " in text) and (
-                            "───[/剪贴板]───" in text or "───[/Clipboard]───" in text
-                        ):
-                            continue
-                        # 截断超长（>4000 字符）以防拉爆日志
-                        if len(text) > 4000:
-                            text = text[:4000] + "…（截断）"
+                        if len(text) >= CLIPBOARD_MAX_CHARS:
+                            text = text[:CLIPBOARD_MAX_CHARS] + "…（截断）"
                         self.store.append("clip", text)
             except Exception:
                 pass
@@ -989,8 +1189,16 @@ class UIAWatcher(threading.Thread):
         # 以控件 RuntimeId 为键的最近提交去重：{(rid, seg_text): expires_at}
         recent_commits = {}
         get_press = self.key_hooker.get_press_count if self.key_hooker else (lambda: 0)
+        had_recent_press = self.key_hooker.had_recent_press if self.key_hooker else (lambda max_age=3.0: False)
 
         while not self._stop.is_set():
+            if not (self.store.keylog_enabled and self.store.uia_enabled):
+                last_ctrl_key = None
+                last_value = ""
+                last_press_count = get_press()
+                recent_commits.clear()
+                self._stop.wait(0.4)
+                continue
             try:
                 ctrl = auto.GetFocusedControl()
                 if ctrl is None:
@@ -1024,14 +1232,13 @@ class UIAWatcher(threading.Thread):
                 if val != last_value:
                     cur_press = get_press()
                     press_advanced = cur_press > last_press_count
-                    # [2026-07-13 diag] 一号嫌犯 press_advanced 门闩暂时关闭。
-                    # 本意：鼠标点候选、网络推送、光标闪烁等 val 变化会被拦掉。
-                    # 副作用：鼠标点候选字 / IME 延迟提交时 press_count 不涨 → 中文丢。
-                    # if not press_advanced:
-                    #     last_value = val
-                    #     last_press_count = cur_press
-                    #     self._stop.wait(0.35)
-                    #     continue
+                    # Programmatic updates and incoming messages must not be logged.
+                    # A short recent-key window still permits mouse-selected IME candidates.
+                    if not press_advanced and not had_recent_press(3.0):
+                        last_value = val
+                        last_press_count = cur_press
+                        self._stop.wait(0.35)
+                        continue
 
                     # 找共同前缀（增量 diff）
                     n = 0
@@ -1068,13 +1275,6 @@ class UIAWatcher(threading.Thread):
                                 self.key_hooker.discard_ascii_buffer()
                             except Exception:
                                 pass
-                        # [2026-07-13 diag] stderr 打印实际抓到的 added，长官现场肉眼验
-                        if cjk_segs:
-                            try:
-                                sys.stderr.write(f"[UIA] added={added!r} cjk={cjk_segs}\n")
-                                sys.stderr.flush()
-                            except Exception:
-                                pass
                         for seg in cjk_segs:
                             if not seg:
                                 continue
@@ -1093,6 +1293,640 @@ class UIAWatcher(threading.Thread):
 
 
 # ============================================================
+#                 内置文本编辑器
+# ============================================================
+def _count_document_characters(content):
+    """统计非空白字符，作为中英文通用的字数。"""
+    return sum(1 for char in content if not char.isspace())
+
+
+def _write_text_document(path, content):
+    """以 UTF-8 保存文本文档。"""
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(content)
+
+
+def _scaled_editor_metrics(screen_height):
+    """以 2560×1440 为基准，按右上角锚点等比缩放窗口。"""
+    scale = max(0.25, float(screen_height) / TEXT_EDITOR_REFERENCE_HEIGHT)
+    width = max(1, round(TEXT_EDITOR_WIDTH * scale))
+    height = max(1, round(TEXT_EDITOR_HEIGHT * scale))
+    right = round(TEXT_EDITOR_RIGHT * scale)
+    return {
+        "scale": scale,
+        "right": right,
+        "x": right - width,
+        "y": round(TEXT_EDITOR_Y * scale),
+        "width": width,
+        "height": height,
+    }
+
+
+def _scaled_editor_geometry(virtual_bounds, screen_height):
+    """计算缩放后的 Tk geometry，严格保留指定的虚拟桌面坐标。"""
+    del virtual_bounds  # 坐标可指向当前会话不可见的右侧副屏，不做单屏夹取。
+    metrics = _scaled_editor_metrics(screen_height)
+    return (
+        f"{metrics['width']}x{metrics['height']}"
+        f"{metrics['x']:+d}{metrics['y']:+d}",
+        metrics["scale"],
+    )
+
+
+def _scroll_thumb_color(opacity=TEXT_EDITOR_SCROLL_OPACITY):
+    """将深灰滑块按指定不透明度与白色背景预混合。"""
+    opacity = min(1.0, max(0.0, float(opacity)))
+    channel = round(90 * opacity + 255 * (1.0 - opacity))
+    return f"#{channel:02x}{channel:02x}{channel:02x}"
+
+
+class _DWM_MARGINS(ctypes.Structure):
+    _fields_ = [
+        ("cxLeftWidth", ctypes.c_int),
+        ("cxRightWidth", ctypes.c_int),
+        ("cyTopHeight", ctypes.c_int),
+        ("cyBottomHeight", ctypes.c_int),
+    ]
+
+
+def _window_handle(win):
+    """返回 Tk 顶层窗口对应的原生 Windows 外框句柄。"""
+    win.update_idletasks()
+    frame = win.wm_frame()
+    return int(frame, 16) if isinstance(frame, str) else int(frame)
+
+
+def _enable_native_window_shadow(win, dwmapi=None, hwnd=None):
+    """要求 DWM 按当前原生窗口样式绘制非客户区和系统阴影。"""
+    try:
+        hwnd = _window_handle(win) if hwnd is None else int(hwnd)
+        if not hwnd:
+            return False
+        if dwmapi is None:
+            dwmapi = ctypes.WinDLL("dwmapi")
+
+        dwmapi.DwmSetWindowAttribute.argtypes = [
+            wt.HWND, wt.DWORD, ctypes.c_void_p, wt.DWORD,
+        ]
+        dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+        dwmapi.DwmExtendFrameIntoClientArea.argtypes = [
+            wt.HWND, ctypes.POINTER(_DWM_MARGINS),
+        ]
+        dwmapi.DwmExtendFrameIntoClientArea.restype = ctypes.c_long
+
+        # DWMWA_NCRENDERING_POLICY=2, DWMNCRP_ENABLED=2
+        policy = ctypes.c_int(2)
+        policy_result = dwmapi.DwmSetWindowAttribute(
+            hwnd, 2, ctypes.byref(policy), ctypes.sizeof(policy)
+        )
+        margins = _DWM_MARGINS(1, 1, 1, 1)
+        frame_result = dwmapi.DwmExtendFrameIntoClientArea(
+            hwnd, ctypes.byref(margins)
+        )
+        return policy_result >= 0 and frame_result >= 0
+    except Exception:
+        return False
+
+
+def _configure_native_frameless_window(win, user32=None, dwmapi=None):
+    """保留 DWM 原生框架能力，同时把 Tk 客户区扩展成无标题栏外观。
+
+    返回值必须由调用方持有：其中的 Python WndProc 回调在 HWND 生命周期内
+    不能被垃圾回收。
+    """
+    try:
+        hwnd = _window_handle(win)
+        if not hwnd:
+            return None
+        if user32 is None:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+        if dwmapi is None:
+            dwmapi = ctypes.WinDLL("dwmapi")
+
+        get_window_long = user32.GetWindowLongW
+        get_window_long.argtypes = [wt.HWND, ctypes.c_int]
+        get_window_long.restype = ctypes.c_long
+        set_window_long_ptr = user32.SetWindowLongPtrW
+        set_window_long_ptr.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_void_p]
+        set_window_long_ptr.restype = ctypes.c_void_p
+        call_window_proc = user32.CallWindowProcW
+        call_window_proc.argtypes = [
+            ctypes.c_void_p, wt.HWND, wt.UINT, ctypes.c_size_t,
+            ctypes.c_ssize_t,
+        ]
+        call_window_proc.restype = ctypes.c_ssize_t
+        set_window_pos = user32.SetWindowPos
+        set_window_pos.argtypes = [
+            wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, wt.UINT,
+        ]
+        set_window_pos.restype = wt.BOOL
+
+        # 保留标准顶层窗口样式，让 DWM 将它视为可绘制原生阴影的窗口。
+        gwl_style = -16
+        gwlp_wndproc = -4
+        ws_caption = 0x00C00000
+        ws_thickframe = 0x00040000
+        ws_sysmenu = 0x00080000
+        ws_minimizebox = 0x00020000
+        style = int(get_window_long(hwnd, gwl_style))
+        native_style = (
+            style | ws_caption | ws_thickframe | ws_sysmenu | ws_minimizebox
+        )
+        user32.SetWindowLongW.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_long]
+        user32.SetWindowLongW.restype = ctypes.c_long
+        user32.SetWindowLongW(hwnd, gwl_style, native_style)
+
+        wm_nccalcsize = 0x0083
+        wm_ncaactivate = 0x0086
+        wndproc_type = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t, wt.HWND, wt.UINT,
+            ctypes.c_size_t, ctypes.c_ssize_t,
+        )
+        original_wndproc = ctypes.c_void_p()
+
+        @wndproc_type
+        def frameless_wndproc(message_hwnd, message, wparam, lparam):
+            try:
+                if message == wm_nccalcsize and wparam:
+                    # 整个窗口矩形都交给 Tk 绘制；原生样式仍留给 DWM 生成阴影。
+                    return 0
+                if message == wm_ncaactivate:
+                    # 阻止激活状态变化触发标准标题栏重绘。
+                    return 1
+                return call_window_proc(
+                    original_wndproc, message_hwnd, message, wparam, lparam
+                )
+            except Exception:
+                return call_window_proc(
+                    original_wndproc, message_hwnd, message, wparam, lparam
+                )
+
+        callback_ptr = ctypes.cast(frameless_wndproc, ctypes.c_void_p)
+        previous = set_window_long_ptr(hwnd, gwlp_wndproc, callback_ptr)
+        previous_value = (
+            previous.value if isinstance(previous, ctypes.c_void_p) else int(previous)
+        )
+        if not previous_value:
+            return None
+        original_wndproc.value = previous_value
+
+        # SWP_FRAMECHANGED 使新样式立即重新计算；不移动、不缩放、不抢焦点。
+        swp_flags = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020
+        set_window_pos(hwnd, 0, 0, 0, 0, 0, swp_flags)
+        if not _enable_native_window_shadow(win, dwmapi, hwnd=hwnd):
+            set_window_long_ptr(
+                hwnd, gwlp_wndproc, ctypes.c_void_p(original_wndproc.value)
+            )
+            return None
+        return {
+            "hwnd": hwnd,
+            "wndproc": frameless_wndproc,
+            "original_wndproc": original_wndproc,
+        }
+    except Exception:
+        return None
+
+
+def _set_native_window_bounds(hwnd, metrics, user32=None):
+    """按外框尺寸精确定位 HWND，避免 Tk 把隐藏边框再次计入 geometry。"""
+    try:
+        if user32 is None:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.SetWindowPos.argtypes = [
+            wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, wt.UINT,
+        ]
+        user32.SetWindowPos.restype = wt.BOOL
+        # SWP_NOZORDER | SWP_NOACTIVATE
+        return bool(user32.SetWindowPos(
+            int(hwnd), 0,
+            int(metrics["x"]), int(metrics["y"]),
+            int(metrics["width"]), int(metrics["height"]),
+            0x0004 | 0x0010,
+        ))
+    except Exception:
+        return False
+
+
+def _virtual_screen_metrics(win):
+    """返回虚拟桌面边界和主屏物理高度。"""
+    try:
+        user32 = ctypes.windll.user32
+        left = int(user32.GetSystemMetrics(76))
+        top = int(user32.GetSystemMetrics(77))
+        width = int(user32.GetSystemMetrics(78))
+        height = int(user32.GetSystemMetrics(79))
+        primary_height = int(user32.GetSystemMetrics(1))
+        if width <= 0 or height <= 0 or primary_height <= 0:
+            raise OSError("GetSystemMetrics failed")
+        return (left, top, left + width, top + height), primary_height
+    except Exception:
+        width = win.winfo_screenwidth()
+        height = win.winfo_screenheight()
+        return (0, 0, width, height), height
+
+
+class TextDocumentWindow:
+    """轻量文本编辑器：自动换行、14 号字、字数统计与保存。"""
+
+    def __init__(self, root, on_closed=None):
+        self.file_path = None
+        self._dirty = False
+        self._on_closed = on_closed
+        self._closed = False
+        self._native_frame = None
+
+        self.win = tk.Toplevel(root)
+        # 在原生框架完成配置前保持隐藏，避免标准标题栏短暂闪现。
+        self.win.withdraw()
+        virtual_bounds, screen_height = _virtual_screen_metrics(self.win)
+        geometry, self._ui_scale = _scaled_editor_geometry(
+            virtual_bounds, screen_height
+        )
+        self._editor_metrics = _scaled_editor_metrics(screen_height)
+        self._editor_geometry = geometry
+        self.win.geometry(geometry)
+        self.win.protocol("WM_DELETE_WINDOW", self._close)
+        self.win.configure(bg="#ffffff")
+
+        top_height = max(30, round(38 * self._ui_scale))
+        self.top_bar = tk.Frame(
+            self.win, bg="#f3f3f3", height=top_height, bd=0,
+            highlightthickness=0,
+        )
+        self.top_bar.pack(fill="x", side="top")
+        self.top_bar.pack_propagate(False)
+
+        self._file_button = tk.Menubutton(
+            self.top_bar,
+            bg="#f3f3f3",
+            fg="#202020",
+            activebackground="#e2e2e2",
+            activeforeground="#202020",
+            relief="flat",
+            bd=0,
+            font=("Microsoft YaHei UI", 10),
+            padx=max(9, round(12 * self._ui_scale)),
+        )
+        self._file_button.pack(side="left", fill="y")
+
+        self._close_button = tk.Button(
+            self.top_bar,
+            text="×",
+            command=self._close,
+            bg="#f3f3f3",
+            fg="#333333",
+            activebackground="#e81123",
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            font=("Segoe UI", 13),
+            width=3,
+        )
+        self._close_button.pack(side="right", fill="y")
+
+        self.count_label = tk.Label(
+            self.top_bar,
+            anchor="e",
+            bg="#f3f3f3",
+            fg="#555555",
+            font=("Microsoft YaHei UI", 9),
+            padx=max(8, round(10 * self._ui_scale)),
+        )
+        self.count_label.pack(side="right", fill="y")
+
+        for drag_widget in (self.top_bar, self.count_label):
+            drag_widget.bind("<ButtonPress-1>", self._start_drag)
+            drag_widget.bind("<B1-Motion>", self._drag_window)
+
+        body = tk.Frame(self.win, bg="#ffffff")
+        body.pack(fill="both", expand=True)
+
+        self.text = tk.Text(
+            body,
+            wrap=TEXT_EDITOR_WRAP,
+            undo=True,
+            maxundo=-1,
+            font=("Microsoft YaHei UI", TEXT_EDITOR_FONT_SIZE),
+            bg="#ffffff",
+            fg="#202020",
+            insertbackground="#202020",
+            selectbackground="#b7d7ff",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            padx=max(10, round(14 * self._ui_scale)),
+            pady=max(8, round(12 * self._ui_scale)),
+            yscrollcommand=self._on_text_scroll,
+        )
+        self.text.pack(fill="both", expand=True)
+
+        self._scroll_width = max(7, round(10 * self._ui_scale))
+        self._scroll_range = (0.0, 1.0)
+        self._scroll_thumb = (0, 0)
+        self._scroll_drag_offset = None
+        self.scroll_overlay = tk.Canvas(
+            body,
+            width=self._scroll_width,
+            bg="#ffffff",
+            bd=0,
+            highlightthickness=0,
+            cursor="sb_v_double_arrow",
+        )
+        self.scroll_overlay.bind("<Configure>", self._redraw_scroll_overlay)
+        self.scroll_overlay.bind("<ButtonPress-1>", self._scrollbar_press)
+        self.scroll_overlay.bind("<B1-Motion>", self._scrollbar_drag)
+        self.scroll_overlay.bind(
+            "<ButtonRelease-1>", lambda _event: setattr(
+                self, "_scroll_drag_offset", None
+            )
+        )
+        self.scroll_overlay.bind("<MouseWheel>", self._scrollbar_wheel)
+
+        self.text.bind("<<Modified>>", self._on_modified)
+        self.win.bind("<Control-s>", self._save_shortcut)
+        self.win.bind("<Control-Shift-s>", self._save_as_shortcut)
+        self.win.bind("<Control-Shift-S>", self._save_as_shortcut)
+
+        self._lang_listener = self._refresh_language
+        register_lang_listener(self._lang_listener)
+        self._refresh_language()
+        self.text.edit_modified(False)
+        self._update_count()
+
+        # 创建时短暂置顶以确保可见，随后恢复普通窗口层级。
+        try:
+            self.win.attributes("-topmost", True)
+            self.win.after_idle(self._show_with_native_frame)
+        except Exception:
+            self.win.deiconify()
+            self.text.focus_set()
+
+    def _build_menu(self):
+        old_menu = getattr(self, "_file_menu", None)
+        file_menu = tk.Menu(self._file_button, tearoff=False)
+        file_menu.add_command(
+            label=t("text_editor_save"), accelerator="Ctrl+S", command=self._save
+        )
+        file_menu.add_command(
+            label=t("text_editor_save_as"),
+            accelerator="Ctrl+Shift+S",
+            command=self._save_as,
+        )
+        file_menu.add_separator()
+        file_menu.add_command(label=t("text_editor_close"), command=self._close)
+        self._file_button.config(text=t("text_editor_file"), menu=file_menu)
+        self._file_menu = file_menu
+        if old_menu is not None:
+            try:
+                old_menu.destroy()
+            except Exception:
+                pass
+
+    def _start_drag(self, event):
+        self._drag_offset = (
+            event.x_root - self.win.winfo_x(),
+            event.y_root - self.win.winfo_y(),
+        )
+
+    def _drag_window(self, event):
+        try:
+            offset_x, offset_y = self._drag_offset
+            x = event.x_root - offset_x
+            y = event.y_root - offset_y
+            self.win.geometry(f"{x:+d}{y:+d}")
+        except Exception:
+            pass
+
+    def _focus_editor(self):
+        try:
+            self.win.lift()
+            self.win.focus_force()
+            self.text.focus_set()
+        except Exception:
+            pass
+
+    def _on_text_scroll(self, first, last):
+        first = float(first)
+        last = float(last)
+        self._scroll_range = (first, last)
+        overlay = getattr(self, "scroll_overlay", None)
+        if overlay is None:
+            return
+        if first <= 0.0 and last >= 1.0:
+            overlay.place_forget()
+            return
+        overlay.place(
+            relx=1.0,
+            x=-max(3, round(4 * self._ui_scale)),
+            y=max(4, round(6 * self._ui_scale)),
+            anchor="ne",
+            width=self._scroll_width,
+            relheight=1.0,
+            height=-max(8, round(12 * self._ui_scale)),
+        )
+        overlay.tk.call("raise", overlay._w)
+        overlay.after_idle(self._redraw_scroll_overlay)
+
+    def _redraw_scroll_overlay(self, _event=None):
+        overlay = getattr(self, "scroll_overlay", None)
+        if overlay is None or not overlay.winfo_ismapped():
+            return
+        first, last = self._scroll_range
+        height = max(1, overlay.winfo_height())
+        width = max(1, overlay.winfo_width())
+        thumb_top = round(first * height)
+        thumb_bottom = round(last * height)
+        min_thumb = max(24, round(30 * self._ui_scale))
+        if thumb_bottom - thumb_top < min_thumb:
+            thumb_bottom = min(height, thumb_top + min_thumb)
+            thumb_top = max(0, thumb_bottom - min_thumb)
+        self._scroll_thumb = (thumb_top, thumb_bottom)
+        overlay.delete("all")
+        overlay.create_rectangle(
+            0,
+            thumb_top,
+            width,
+            thumb_bottom,
+            fill=_scroll_thumb_color(),
+            outline="",
+        )
+
+    def _scrollbar_press(self, event):
+        top, bottom = self._scroll_thumb
+        if top <= event.y <= bottom:
+            self._scroll_drag_offset = event.y - top
+        else:
+            self._scroll_drag_offset = max(0, (bottom - top) // 2)
+            self._scrollbar_drag(event)
+
+    def _scrollbar_drag(self, event):
+        if self._scroll_drag_offset is None:
+            return
+        height = max(1, self.scroll_overlay.winfo_height())
+        thumb_height = max(1, self._scroll_thumb[1] - self._scroll_thumb[0])
+        max_top = max(1, height - thumb_height)
+        thumb_top = min(max(0, event.y - self._scroll_drag_offset), max_top)
+        self.text.yview_moveto(thumb_top / height)
+
+    def _scrollbar_wheel(self, event):
+        units = -1 if event.delta > 0 else 1
+        self.text.yview_scroll(units * 3, "units")
+        return "break"
+
+    def _focus_and_release_topmost(self):
+        try:
+            self.win.attributes("-topmost", False)
+            self._focus_editor()
+        except Exception:
+            pass
+
+    def _show_with_native_frame(self):
+        """配置原生无框外观后再显示，映射后重申 DWM 阴影策略。"""
+        try:
+            # Tk 会在 withdrawn -> normal 时重建外层 HWND；必须先映射，再对子类化
+            # 最终句柄。先透明显示可避免标准标题栏在这一步短暂闪现。
+            self.win.attributes("-alpha", 0.0)
+            self.win.deiconify()
+            # 映射消息处理完后 wm_frame() 才会从内部 Tk 子窗口切换为真正
+            # 的顶层包装 HWND。
+            self.win.after(20, self._finish_native_frame_setup)
+        except Exception:
+            self.win.deiconify()
+            self._focus_and_release_topmost()
+
+    def _finish_native_frame_setup(self):
+        try:
+            self._native_frame = _configure_native_frameless_window(self.win)
+            if self._native_frame:
+                _set_native_window_bounds(
+                    self._native_frame["hwnd"], self._editor_metrics
+                )
+            else:
+                self.win.geometry(self._editor_geometry)
+            self.win.attributes("-alpha", 1.0)
+            self.win.after(
+                20,
+                lambda: _enable_native_window_shadow(
+                    self.win,
+                    hwnd=(self._native_frame or {}).get("hwnd"),
+                ),
+            )
+            self.win.after(120, self._focus_and_release_topmost)
+        except Exception:
+            self.win.attributes("-alpha", 1.0)
+            self._focus_and_release_topmost()
+
+    def _document_name(self):
+        if self.file_path:
+            return os.path.basename(self.file_path)
+        return t("text_editor_untitled")
+
+    def _update_title(self):
+        dirty = "*" if self._dirty else ""
+        self.win.title(
+            f"{dirty}{self._document_name()} - {t('text_editor_suffix')}"
+        )
+
+    def _content(self):
+        return self.text.get("1.0", "end-1c")
+
+    def _update_count(self):
+        count = _count_document_characters(self._content())
+        self.count_label.config(text=t("text_editor_chars", count=count))
+
+    def _on_modified(self, _event=None):
+        if not self.text.edit_modified():
+            return
+        self._dirty = True
+        self.text.edit_modified(False)
+        self._update_title()
+        self._update_count()
+
+    def _save_shortcut(self, _event=None):
+        self._save()
+        return "break"
+
+    def _save_as_shortcut(self, _event=None):
+        self._save_as()
+        return "break"
+
+    def _save(self):
+        if not self.file_path:
+            return self._save_as()
+        try:
+            _write_text_document(self.file_path, self._content())
+        except OSError as exc:
+            messagebox.showerror(
+                t("text_editor_save_error_title"),
+                t("text_editor_save_error", err=exc),
+                parent=self.win,
+            )
+            return False
+        self._dirty = False
+        self._update_title()
+        return True
+
+    def _save_as(self):
+        path = filedialog.asksaveasfilename(
+            parent=self.win,
+            title=t("text_editor_save_as"),
+            defaultextension=".txt",
+            filetypes=[
+                (t("text_editor_filetype"), "*.txt"),
+                (t("text_editor_all_files"), "*.*"),
+            ],
+        )
+        if not path:
+            return False
+        previous_path = self.file_path
+        self.file_path = path
+        if self._save():
+            return True
+        self.file_path = previous_path
+        self._update_title()
+        return False
+
+    def _refresh_language(self):
+        try:
+            if not self.win.winfo_exists():
+                return
+            self._build_menu()
+            self._update_title()
+            self._update_count()
+        except Exception:
+            pass
+
+    def _close(self):
+        if self._closed:
+            return
+        if self._dirty:
+            choice = messagebox.askyesnocancel(
+                t("text_editor_close_title"),
+                t("text_editor_close_msg"),
+                parent=self.win,
+            )
+            if choice is None:
+                return
+            if choice and not self._save():
+                return
+
+        self._closed = True
+        try:
+            unregister_lang_listener(self._lang_listener)
+        except Exception:
+            pass
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+        finally:
+            if self._on_closed is not None:
+                self._on_closed()
+
+
+# ============================================================
 #              KeyLog Viewer（Tk 只读窗口）
 # ============================================================
 class KeyLogViewer:
@@ -1100,8 +1934,9 @@ class KeyLogViewer:
         self.store = store
         self._app = None            # 可选：既存在就用于开关切换后重创 watcher
         # 分段加载状态
-        self._recs = []            # 已加载最近 N 天的全部 recs（元数据轻，字符大头在 text 字段）
-        self._loaded_from = 0      # 已渲染区间在 _recs 中的起始索引（[_loaded_from, len(_recs)) 已渲染）
+        self._recs = []            # 仅保留已经分页读取并显示的记录
+        self._before_offset = None # 下一页从该 JSONL 字节偏移之前读取
+        self._has_older = False
         self._loading = False
         self._sb = None
         self.win = tk.Toplevel(root)
@@ -1314,21 +2149,6 @@ class KeyLogViewer:
             pass
 
     # ---------- 分段加载核心 ----------
-    @staticmethod
-    def _approx_rec_len(rec):
-        """估算一条 rec 在渲染 body 中占的字符数。
-        接前面指示：[xxx] 特殊键标签不计入预算，只累积真正的内容字符。
-        clip 仍按实际开销计。"""
-        text = rec.get("text", "") or ""
-        kind = rec.get("kind")
-        if kind == "clip":
-            return len(text) + 60  # 剪贴板块外框固定开销约 60 字符
-        if kind == "key":
-            # 特殊键 / 快捷键标签形式均为 [*xxx]，不计入预算
-            if len(text) >= 3 and text.startswith("[*") and text.endswith("]"):
-                return 0
-        return len(text)
-
     def _apply_tags_range(self, start_index, end_index):
         """给 Text 里 [start_index, end_index) 区间打 clip / special 高亮标签。"""
         body = self.text.get(start_index, end_index)
@@ -1358,21 +2178,20 @@ class KeyLogViewer:
             self.text.tag_add("special", s, e)
 
     def _update_count_label(self):
-        total = len(self._recs)
-        loaded_recs = total - self._loaded_from
+        loaded_recs = len(self._recs)
         # 已加载字符数
         try:
             loaded_chars = int(self.text.count("1.0", "end-1c", "chars")[0])
         except Exception:
             loaded_chars = 0
-        if self._loaded_from <= 0:
+        if not self._has_older:
             self.count_label.config(
-                text=t("count_full", total=total, chars=loaded_chars),
+                text=t("count_full", total=loaded_recs, chars=loaded_chars),
                 fg="#aaaaaa",
             )
         else:
             self.count_label.config(
-                text=t("count_partial", total=total, loaded=loaded_recs, chars=loaded_chars),
+                text=t("count_paged", loaded=loaded_recs, chars=loaded_chars),
                 fg="#aaaaaa",
             )
 
@@ -1397,9 +2216,12 @@ class KeyLogViewer:
 
         def _worker():
             try:
-                recs = self.store.load_recent()
+                recs, before, has_older = self.store.load_page_before(
+                    end_offset=None,
+                    target_chars=KEYLOG_INITIAL_CHARS,
+                )
             except Exception:
-                recs = []
+                recs, before, has_older = [], 0, False
             def _apply():
                 # 旧代回调：已被新 _reload 覆盖
                 if getattr(self, "_reload_gen", 0) != gen:
@@ -1410,10 +2232,13 @@ class KeyLogViewer:
                 except Exception:
                     return
                 self._recs = recs
-                self._loaded_from = len(recs)
-                # 装尾部初始块
+                self._before_offset = before
+                self._has_older = has_older
                 try:
-                    self._load_older(target_chars=KEYLOG_INITIAL_CHARS, initial=True)
+                    segment = KeyLogStore.format_records(recs)
+                    self.text.configure(state="normal")
+                    self.text.insert("end", segment)
+                    self._apply_tags_range("1.0", "end-1c")
                 finally:
                     self._loading = False
 
@@ -1683,7 +2508,7 @@ class KeyLogViewer:
     def _maybe_load_older_from_action(self):
         """用户主动向上滚动 → 视口已在顶部且还有更早内容 → 拉一段。
         关键：只在人滑时才运行，yview/see 引起的位置变化不会自己触发自己。"""
-        if self._loading or self._loaded_from <= 0:
+        if self._loading or not self._has_older:
             return
         try:
             first = float(self.text.yview()[0])
@@ -1698,70 +2523,46 @@ class KeyLogViewer:
         self._loading = False
 
     def _load_older(self, target_chars=KEYLOG_CHUNK_CHARS, initial=False):
-        """向前追加加载一段。initial=True 表示由 _reload 直接调用（Text 当前为空）。
-        acc 按“可见字符”计（[xxx] 算 0），但同时有 rec 条数硬上限，
-        避免尾部堆满 [xxx] 时 acc 算不动→把整个 log 推穿。"""
-        if not initial:
-            if self._loading or self._loaded_from <= 0:
-                return
-            self._loading = True
-        cooldown_scheduled = False
-        # 条数硬上限：可见字符预算 * 4，共同作为尾列全 [xxx] 时的上限
-        MAX_RECS_PER_LOAD = max(400, target_chars * 4)
-        try:
-            # 从 _loaded_from 向前累积到 target_chars（可见字符），或到 MAX_RECS_PER_LOAD 条
-            acc = 0
-            new_start = self._loaded_from
-            while (
-                new_start > 0
-                and acc < target_chars
-                and (self._loaded_from - new_start) < MAX_RECS_PER_LOAD
-            ):
-                new_start -= 1
-                acc += self._approx_rec_len(self._recs[new_start])
-            if new_start >= self._loaded_from:
-                return  # 没得可加载
+        """Read and prepend one bounded page from disk."""
+        if self._loading or not self._has_older:
+            return
+        self._loading = True
+        end_offset = self._before_offset
 
-            segment = KeyLogStore.format_records(
-                self._recs[new_start:self._loaded_from]
+        def _worker():
+            recs, before, has_older = self.store.load_page_before(
+                end_offset=end_offset,
+                target_chars=target_chars,
             )
-            if not segment:
-                self._loaded_from = new_start
-                return
 
-            self.text.configure(state="normal")
-            if initial:
-                # Text 是空的，直接 insert 到 end
-                self.text.insert("end", segment)
-                self._apply_tags_range("1.0", "end-1c")
-            else:
-                # 错锨方案：先把当前视口顶部可见行头打上 mark——
-                # 之后往 "1.0" 插入任何内容，mark 会自动跟着它原本那个字符往后走，
-                # 插完后把视口回到 mark 所在行 → 长官还看着同一行内容，位置完全不动
-                anchor = "__olderload_anchor__"
-                self.text.mark_set(anchor, "@0,0")
-                # gravity=left: 在 anchor 处插入时 mark 留在插入文本前（默认）
-                # 我们是在 "1.0"——在 anchor 左侧——插入，mark 不受 gravity 影响，自动向后跟随
-                self.text.insert("1.0", segment)
-                seg_end = f"1.0+{len(segment)}c"
-                self._apply_tags_range("1.0", seg_end)
-                # 把 anchor 所在行滑到视口顶部，保证不在最顶 → first > 0.02 不会再自触发
+            def _apply():
                 try:
-                    self.text.yview(f"{anchor} linestart")
-                except Exception:
-                    pass
-                self.text.mark_unset(anchor)
+                    if not self.win.winfo_exists():
+                        return
+                    segment = KeyLogStore.format_records(recs)
+                    if segment:
+                        anchor = "__olderload_anchor__"
+                        self.text.mark_set(anchor, "@0,0")
+                        self.text.insert("1.0", segment)
+                        self._apply_tags_range("1.0", f"1.0+{len(segment)}c")
+                        try:
+                            self.text.yview(f"{anchor} linestart")
+                        except Exception:
+                            pass
+                        self.text.mark_unset(anchor)
+                        self._recs = recs + self._recs
+                    self._before_offset = before
+                    self._has_older = has_older
+                    self._update_count_label()
+                finally:
+                    self.win.after(120, self._release_loading)
 
-            self._loaded_from = new_start
-            self._update_count_label()
-
-            # 非 initial：延迟释放 loading 锁，塔防 yscrollcommand 回调瞬发造成的重入
-            if not initial:
-                cooldown_scheduled = True
-                self.win.after(120, self._release_loading)
-        finally:
-            if not initial and not cooldown_scheduled:
+            try:
+                self.win.after(0, _apply)
+            except Exception:
                 self._loading = False
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _selection_text_without_special(self):
         """返回选区文本，剪除所有 special tag 范围里的字符。"""
@@ -1836,43 +2637,14 @@ class KeyLogViewer:
         return "break"  # 拦截默认复制行为，避免把带 special 的原文写回
 
     def _copy_all(self):
-        """复制全部记录（含尚未渲染的更早段），从 recs 直接 format，绕过 Text 分段限制。
-        剪除 [xxx] / [xxx]*N 特殊键标签，保留剪贴板块内容。"""
+        """Stream all retained records into a bounded clipboard payload."""
         try:
-            body = KeyLogStore.format_records(self._recs)
-            # 收集所有 clip 区间，作为白名单（不剪）
-            clip_ranges = []
-            for mm in re.finditer(
-                r"───\[(?:剪贴板|Clipboard) [^\]]+\]───\n.*?\n───\[/(?:剪贴板|Clipboard)\]───",
-                body, flags=re.DOTALL,
-            ):
-                clip_ranges.append((mm.start(), mm.end()))
-
-            def _in_clip(pos):
-                for s, e in clip_ranges:
-                    if s <= pos < e:
-                        return True
-                return False
-
-            cuts = []
-            for mm in re.finditer(r"\[\*[^\]\n]+\](?:\*\d+)?", body):
-                if _in_clip(mm.start()):
-                    continue
-                cuts.append((mm.start(), mm.end()))
-            if cuts:
-                out = []
-                prev = 0
-                for s, e in cuts:
-                    if s > prev:
-                        out.append(body[prev:s])
-                    prev = e
-                if prev < len(body):
-                    out.append(body[prev:])
-                body = "".join(out)
-
+            body = self.store.build_copy_text(KEYLOG_COPY_MAX_CHARS)
             suppress_clipboard(body)
             self.win.clipboard_clear()
             self.win.clipboard_append(body)
+        except ValueError:
+            self._toast_err(t("copy_too_large", limit=KEYLOG_COPY_MAX_CHARS))
         except Exception:
             pass
 
@@ -1925,45 +2697,57 @@ class KeyLogViewer:
 
 
 # ============================================================
-#              托盘图标（保持原生成逻辑）
+#              托盘图标
 # ============================================================
 def _build_tray_icon_image(size=64):
+    """按目标像素尺寸直接绘制一张只有横线的空白练习纸。"""
+    size = max(8, int(size))
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    pad = 2
-    radius = 14
-    draw.rounded_rectangle(
-        [pad, pad, size - pad, size - pad],
-        radius=radius,
-        fill=(30, 30, 30, 235),
-        outline=(74, 144, 226, 255),
-        width=3,
+
+    margin_x = max(2, round(size * 0.16))
+    margin_y = max(1, round(size * 0.06))
+    left, top = margin_x, margin_y
+    right, bottom = size - margin_x - 1, size - margin_y - 1
+    fold = max(2, round(size * 0.19))
+    stroke = 1 if size <= 24 else max(1, round(size / 28))
+
+    paper = [
+        (left, top),
+        (right - fold, top),
+        (right, top + fold),
+        (right, bottom),
+        (left, bottom),
+    ]
+    draw.polygon(
+        paper,
+        fill=(250, 250, 247, 255),
+        outline=(72, 93, 112, 255),
+        width=stroke,
     )
-    font = None
-    for name, ratio in (("segoeuib.ttf", 0.42), ("arialbd.ttf", 0.42),
-                        ("seguisb.ttf", 0.42), ("arial.ttf", 0.42)):
-        try:
-            font = ImageFont.truetype(name, int(size * ratio))
-            break
-        except Exception:
-            continue
-    if font is None:
-        font = ImageFont.load_default()
-    text = "OCR"
-    try:
-        bbox = draw.textbbox((0, 0), text, font=font)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
-        tx = (size - tw) / 2 - bbox[0]
-        ty = (size - th) / 2 - bbox[1] - 1
-    except Exception:
-        try:
-            tw, th = draw.textsize(text, font=font)
-        except Exception:
-            tw, th = (size * 0.6, size * 0.4)
-        tx = (size - tw) / 2
-        ty = (size - th) / 2
-    draw.text((tx, ty), text, font=font, fill=(255, 225, 77, 255))
+    # 右上折角只用纸张明暗表示，不引入文字或额外符号。
+    draw.polygon(
+        [(right - fold, top), (right - fold, top + fold), (right, top + fold)],
+        fill=(208, 222, 232, 255),
+        outline=(72, 93, 112, 255),
+    )
+
+    line_left = left + max(2, round(size * 0.12))
+    line_right = right - max(1, round(size * 0.08))
+    line_top = top + fold + max(1, round(size * 0.06))
+    line_bottom = bottom - max(2, round(size * 0.12))
+    line_count = 3 if size <= 20 else 4
+    if line_count > 1:
+        positions = [
+            round(line_top + i * (line_bottom - line_top) / (line_count - 1))
+            for i in range(line_count)
+        ]
+        for y in sorted(set(positions)):
+            draw.line(
+                [(line_left, y), (line_right, y)],
+                fill=(75, 145, 194, 255),
+                width=stroke,
+            )
     return img
 
 
@@ -1996,7 +2780,9 @@ _TPM_NONOTIFY = 0x0080
 
 _IMAGE_ICON = 1
 _LR_LOADFROMFILE = 0x00000010
-_LR_DEFAULTSIZE = 0x00000040
+
+_SM_CXSMICON = 49
+_SM_CYSMICON = 50
 
 _MF_STRING = 0x00000000
 _MF_SEPARATOR = 0x00000800
@@ -2080,26 +2866,65 @@ _user32.DestroyMenu.argtypes = [wt.HMENU]
 _user32.DestroyMenu.restype = wt.BOOL
 _user32.SetForegroundWindow.argtypes = [wt.HWND]
 _user32.SetForegroundWindow.restype = wt.BOOL
+_user32.LoadImageW.argtypes = [
+    wt.HINSTANCE, wt.LPCWSTR, wt.UINT, ctypes.c_int, ctypes.c_int, wt.UINT,
+]
+_user32.LoadImageW.restype = wt.HANDLE
+_user32.DestroyIcon.argtypes = [wt.HICON]
+_user32.DestroyIcon.restype = wt.BOOL
+_user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+_user32.GetSystemMetrics.restype = ctypes.c_int
+if hasattr(_user32, "GetDpiForWindow"):
+    _user32.GetDpiForWindow.argtypes = [wt.HWND]
+    _user32.GetDpiForWindow.restype = wt.UINT
+if hasattr(_user32, "GetSystemMetricsForDpi"):
+    _user32.GetSystemMetricsForDpi.argtypes = [ctypes.c_int, wt.UINT]
+    _user32.GetSystemMetricsForDpi.restype = ctypes.c_int
 _shell32.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.POINTER(_NOTIFYICONDATAW)]
 _shell32.Shell_NotifyIconW.restype = wt.BOOL
 
 
-def _pil_to_hicon(pil_img):
-    """把 PIL Image 存为临时 .ico 并用 LoadImageW 载入。
+def _get_tray_icon_size(hwnd=None):
+    """返回当前托盘窗口 DPI 对应的小图标像素尺寸。"""
+    dpi = 96
+    try:
+        if hwnd and hasattr(_user32, "GetDpiForWindow"):
+            dpi = int(_user32.GetDpiForWindow(hwnd)) or 96
+    except Exception:
+        dpi = 96
+
+    try:
+        if hasattr(_user32, "GetSystemMetricsForDpi"):
+            width = _user32.GetSystemMetricsForDpi(_SM_CXSMICON, dpi)
+            height = _user32.GetSystemMetricsForDpi(_SM_CYSMICON, dpi)
+        else:
+            width = _user32.GetSystemMetrics(_SM_CXSMICON)
+            height = _user32.GetSystemMetrics(_SM_CYSMICON)
+    except Exception:
+        width = height = 16
+    return max(1, int(width or 16)), max(1, int(height or 16))
+
+
+def _pil_to_hicon(pil_img, width, height):
+    """把各目标尺寸独立绘制为 .ico 并用 LoadImageW 载入。
     注意：**保留 .ico 文件到 stop 时才删**，因为 Windows shell 在
     重绘 tooltip / 切换 DPI 时可能会根据 HICON 重新读取图标数据。"""
     import tempfile
     fd, path = tempfile.mkstemp(suffix=".ico", prefix="screen_search_tray_")
     os.close(fd)
     try:
-        # 多尺寸 ico，保证不同 DPI 下都清晰
-        pil_img.save(
-            path, format="ICO",
-            sizes=[(16, 16), (20, 20), (24, 24), (32, 32), (40, 40), (48, 48), (64, 64)],
+        # 每一帧都按原生像素独立绘制，禁止 Pillow 从 64x64 自动缩小。
+        icon_sizes = (16, 20, 24, 32, 40, 48, 64)
+        frames = [_build_tray_icon_image(icon_size) for icon_size in icon_sizes]
+        frames[-1].save(
+            path,
+            format="ICO",
+            sizes=[(icon_size, icon_size) for icon_size in icon_sizes],
+            append_images=frames[:-1],
         )
-        # cx=cy=0 且不带 LR_DEFAULTSIZE → Windows 会从 .ico 里选合适尺寸
+        # 必须明确请求 DPI 对应尺寸；0, 0 会固定选中多尺寸 ICO 的第一帧（16x16）。
         hicon = _user32.LoadImageW(
-            None, path, _IMAGE_ICON, 0, 0,
+            None, path, _IMAGE_ICON, width, height,
             _LR_LOADFROMFILE,
         )
         if not hicon:
@@ -2157,7 +2982,14 @@ class NativeTray:
         if self._nid is not None:
             try:
                 self._nid.szTip = self.tooltip[:127]
-                _shell32.Shell_NotifyIconW(_NIM_MODIFY, ctypes.byref(self._nid))
+                # 只提交 tooltip，避免 Explorer 每次状态更新都重新栅格化图标。
+                update = _NOTIFYICONDATAW()
+                update.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+                update.hWnd = self._nid.hWnd
+                update.uID = self._nid.uID
+                update.uFlags = _NIF_TIP
+                update.szTip = self.tooltip[:127]
+                _shell32.Shell_NotifyIconW(_NIM_MODIFY, ctypes.byref(update))
             except Exception:
                 pass
 
@@ -2204,7 +3036,10 @@ class NativeTray:
         return self.hwnd
 
     def _add_icon(self, pil_image):
-        self.hicon, self._icon_path = _pil_to_hicon(pil_image)
+        icon_width, icon_height = _get_tray_icon_size(self.hwnd)
+        self.hicon, self._icon_path = _pil_to_hicon(
+            pil_image, icon_width, icon_height
+        )
         nid = _NOTIFYICONDATAW()
         nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
         nid.hWnd = self.hwnd
@@ -2380,10 +3215,13 @@ class ScreenSearchApp:
         self._ocr_deadline = 0.0
         self._ocr_generation = 0        # 防竞态：每次启动拍 +1，旧线程回写前需校验
         self._ocr_lock = threading.Lock()  # 确保 RapidOCR 实例不被两个线程同时调用
+        self._ocr_stuck_threads = {}    # engine name -> timed-out worker (bounded)
+        self._ocr_active_engine = None
         self._tray_icon = None
         self._tray_thread = None
         self._quit_requested = False
         self._keylog_viewer = None
+        self._text_editors = set()
         self._rapid_ocr = None            # RapidOCR 实例（启动时初始化并常驻）
 
         # 启动后台预热 RapidOCR（首次约 1-2s 加载，不阻主循环）
@@ -2401,9 +3239,10 @@ class ScreenSearchApp:
         # 启动时清一次过期
         threading.Thread(target=self.keylog_store.cleanup, daemon=True).start()
 
-        # 主快捷键 + 输入记录快捷键
+        # 主快捷键 + 输入记录快捷键 + 新建文本快捷键
         keyboard.add_hotkey(HOTKEY, self._on_hotkey_ocr)
         keyboard.add_hotkey(KEYLOG_HOTKEY, self._on_hotkey_keylog)
+        keyboard.add_hotkey(NEW_TEXT_HOTKEY, self._on_hotkey_new_text)
         keyboard.on_press_key(ESC_HOTKEY, self._on_esc, suppress=False)
 
         # 键盘钩子（记录输入）— 必须放在 add_hotkey 之后以避免冲突
@@ -2467,6 +3306,9 @@ class ScreenSearchApp:
     def _on_hotkey_keylog(self):
         self.event_queue.put("show_keylog")
 
+    def _on_hotkey_new_text(self):
+        self.event_queue.put("new_text")
+
     def _on_esc(self, event=None):
         if self.overlay is not None and self.overlay.alive:
             self.event_queue.put("close_overlay")
@@ -2492,12 +3334,24 @@ class ScreenSearchApp:
                         self.overlay = None
                 elif ev == "show_keylog":
                     self._show_keylog()
+                elif ev == "new_text":
+                    self._open_new_text_document()
                 elif ev == "quit":
                     self._shutdown()
                     return
         except queue.Empty:
             pass
         self.root.after(50, self._pump_events)
+
+    def _open_new_text_document(self):
+        """打开一个独立的内置文本编辑器窗口。"""
+        editor = None
+
+        def _on_closed():
+            self._text_editors.discard(editor)
+
+        editor = TextDocumentWindow(self.root, on_closed=_on_closed)
+        self._text_editors.add(editor)
 
     def _show_keylog(self):
         # 若已存在则前置
@@ -2519,6 +3373,18 @@ class ScreenSearchApp:
         except Exception:
             pass
 
+    def _build_tray_menu_spec(self, switch_lang):
+        return [
+            (t("tray_ocr"), lambda: self.event_queue.put("toggle_ocr")),
+            (t("tray_keylog"), lambda: self.event_queue.put("show_keylog")),
+            (t("tray_new_text"), lambda: self.event_queue.put("new_text")),
+            (None, None),
+            (t("tray_language"), [
+                (t("tray_lang_zh"), switch_lang("zh"), {"checked": LANG == "zh"}),
+                (t("tray_lang_en"), switch_lang("en"), {"checked": LANG == "en"}),
+            ]),
+        ]
+
     def _start_tray(self):
         image = _build_tray_icon_image(64)
 
@@ -2532,15 +3398,7 @@ class ScreenSearchApp:
             return _do
 
         def _build_menu_spec():
-            return [
-                (t("tray_ocr"), lambda: self.event_queue.put("toggle_ocr")),
-                (t("tray_keylog"), lambda: self.event_queue.put("show_keylog")),
-                (None, None),
-                (t("tray_language"), [
-                    (t("tray_lang_zh"), _switch_lang("zh"), {"checked": LANG == "zh"}),
-                    (t("tray_lang_en"), _switch_lang("en"), {"checked": LANG == "en"}),
-                ]),
-            ]
+            return self._build_tray_menu_spec(_switch_lang)
 
         self._tray_icon = NativeTray(
             tooltip=self._compose_tray_tooltip(),
@@ -2611,6 +3469,18 @@ class ScreenSearchApp:
         self._start_capture()
 
     def _start_capture(self):
+        self._ocr_stuck_threads = {
+            name: worker for name, worker in self._ocr_stuck_threads.items()
+            if worker is not None and worker.is_alive()
+        }
+        rapid_ready = (
+            getattr(self, "_rapid_ocr", None) is not None
+            and "rapid" not in self._ocr_stuck_threads
+        )
+        active_engine = "rapid" if rapid_ready else "winocr"
+        if active_engine in self._ocr_stuck_threads:
+            self._toast(t("ocr_timeout", sec=OCR_TIMEOUT_SEC))
+            return
         self._busy = True
         try:
             img = ImageGrab.grab(all_screens=True)
@@ -2648,19 +3518,20 @@ class ScreenSearchApp:
         result = self._ocr_result
 
         # 优先用 RapidOCR（PP-OCRv4），不可用时回退到 winocr
-        engine = self._rapid_ocr if getattr(self, "_rapid_ocr", None) is not None else None
-        rgb_img = img.convert("RGB")
+        engine = self._rapid_ocr if active_engine == "rapid" else None
+        rgb_img = img.convert("RGB") if engine is not None else None
+        self._ocr_active_engine = active_engine
 
         ocr_lock = self._ocr_lock
 
         def do_ocr():
             try:
                 if engine is not None:
-                    arr = np.array(rgb_img)  # RGB numpy
                     with ocr_lock:
                         # 二次确认 generation：拿到锁时已作废则直接退出
                         if gen != self._ocr_generation:
                             return
+                        arr = np.array(rgb_img)  # allocate only after acquiring the engine lock
                         out, elapse = engine(arr)
                     if gen != self._ocr_generation:
                         return  # 结果已无主，丢弃
@@ -2687,6 +3558,8 @@ class ScreenSearchApp:
             if time.monotonic() > self._ocr_deadline:
                 # 超时：提升 generation，旧线程无法再写回任何结果
                 self._ocr_generation += 1
+                if self._ocr_thread is not None and self._ocr_thread.is_alive():
+                    self._ocr_stuck_threads[self._ocr_active_engine] = self._ocr_thread
                 self._finish_capture(timeout=True)
                 return
             self.root.after(30, self._poll_ocr)
@@ -2854,6 +3727,8 @@ class ScreenSearchApp:
             self._busy = False
             self._ocr_thread = None
             self._ocr_result = None
+            self._ocr_ctx = None
+            self._ocr_active_engine = None
 
     def _toast(self, text, ms=1500):
         try:
@@ -3763,22 +4638,67 @@ def relaunch_as_admin(extra_args=None):
         return False
 
 
+class SingleInstanceGuard:
+    """Per-installation Windows mutex preventing duplicate hooks and log writers."""
+
+    ERROR_ALREADY_EXISTS = 183
+
+    def __init__(self):
+        import hashlib
+        signature = hashlib.sha256(
+            os.path.abspath(__file__).casefold().encode("utf-8", errors="replace")
+        ).hexdigest()[:16]
+        self.name = f"Local\\OCRKeyboardRecord_{signature}"
+        self.handle = None
+
+    def acquire(self):
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
+        kernel32.CreateMutexW.restype = wt.HANDLE
+        kernel32.CloseHandle.argtypes = [wt.HANDLE]
+        kernel32.CloseHandle.restype = wt.BOOL
+        kernel32.SetLastError(0)
+        handle = kernel32.CreateMutexW(None, False, self.name)
+        if not handle:
+            return False
+        if kernel32.GetLastError() == self.ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return False
+        self.handle = handle
+        return True
+
+    def release(self):
+        if self.handle:
+            try:
+                ctypes.windll.kernel32.CloseHandle(self.handle)
+            finally:
+                self.handle = None
+
+
 def main():
     # 子命令：管理员重启后自动安装开机启动（高权限档）
     if "--set-autostart" in sys.argv:
         if is_admin():
             autostart_install(privileged=True)
-        # 无论成功与否，自动安装完后正常启动主程序
-        try:
-            sys.argv.remove("--set-autostart")
-        except Exception:
-            pass
-    app = ScreenSearchApp()
-    print(t("startup_line", ocr=HOTKEY.upper(), kl=KEYLOG_HOTKEY.upper()))
+        return
+
+    guard = SingleInstanceGuard()
+    if not guard.acquire():
+        return
     try:
-        app.run()
-    except KeyboardInterrupt:
-        pass
+        app = ScreenSearchApp()
+        print(t(
+            "startup_line",
+            ocr=HOTKEY.upper(),
+            kl=KEYLOG_HOTKEY.upper(),
+            nt=NEW_TEXT_HOTKEY.upper(),
+        ))
+        try:
+            app.run()
+        except KeyboardInterrupt:
+            pass
+    finally:
+        guard.release()
 
 
 if __name__ == "__main__":

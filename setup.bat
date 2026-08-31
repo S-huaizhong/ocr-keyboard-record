@@ -68,7 +68,7 @@ set "VENV_PY=%~dp0.venv\Scripts\python.exe"
 
 echo.
 echo [+] Upgrading pip ...
-"%VENV_PY%" -m pip install --upgrade pip
+"%VENV_PY%" -m pip install --upgrade "pip>=26.2"
 
 echo.
 echo [+] Installing dependencies ...
